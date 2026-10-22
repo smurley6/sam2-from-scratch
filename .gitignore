@@ -12,3 +12,4 @@ __pycache__/
 .DS_Store
 /results/
 *.egg-info/
+exports/browser_reference/
