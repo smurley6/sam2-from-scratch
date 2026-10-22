@@ -36,6 +36,9 @@ export interface Constants {
   readonly no_obj_ptr: Float32Array;
   /** `[mem_dim]`; baked into `memory_encoder`, kept for auditing. */
   readonly no_obj_embed_spatial: Float32Array;
+  /** `[16]`, row-major 4x4: `SAM2.mask_downsample`, the stride-4 conv a mask prompt goes through. */
+  readonly mask_downsample_weight: Float32Array;
+  readonly mask_downsample_bias: number;
 }
 
 type Json = Record<string, unknown>;
@@ -63,6 +66,11 @@ function triple(raw: Json, key: string): readonly [number, number, number] {
     throw new Error(`constants: "${key}" must be three numbers`);
   }
   return [v[0] as number, v[1] as number, v[2] as number];
+}
+
+/** One level of nesting removed (`[[...], [...]]` -> `[...]`); anything else is left to `vec` to reject. */
+function flatten(v: unknown): unknown {
+  return Array.isArray(v) && v.every((row) => Array.isArray(row)) ? v.flat() : v;
 }
 
 /** Parse `constants_{S}.json` (an object from `JSON.parse` or the raw text). */
@@ -107,5 +115,7 @@ export function parseConstants(json: string | Json): Constants {
     maskmem_tpos_enc: tposRows,
     no_obj_ptr: vec(raw, "no_obj_ptr", hidden),
     no_obj_embed_spatial: vec(raw, "no_obj_embed_spatial", memDim),
+    mask_downsample_weight: vec({ mask_downsample_weight: flatten(raw["mask_downsample_weight"]) }, "mask_downsample_weight", 16),
+    mask_downsample_bias: vec(raw, "mask_downsample_bias", 1)[0] as number,
   };
 }

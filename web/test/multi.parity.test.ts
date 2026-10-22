@@ -197,7 +197,7 @@ describe.skipIf(!haveExports)("multi-object parity (bmx-trees, rider and bike fr
 
     const empty = new MultiObjectTracker(sessions, consts, source, { height: h, width: w });
     empty.addObject();
-    await expect(empty.propagate().next()).rejects.toThrow(/add a click/);
+    await expect(empty.propagate().next()).rejects.toThrow(/add a prompt/);
     // The failed call released the tracker.
     expect(() => empty.reset()).not.toThrow();
   });

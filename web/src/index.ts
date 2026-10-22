@@ -17,7 +17,7 @@ export {
   type SessionSet,
   type Timings,
 } from "./sessions";
-export { normalize, roundBf16, upsampleBilinear, type Size } from "./preprocess";
+export { maskDownsample, normalize, resizeAntialias, roundBf16, upsampleBilinear, type Size } from "./preprocess";
 export { encodeImage, withMemoryTokens, type FrameFeatures, type ImageFeatures } from "./features";
 export {
   clampMaskInput,

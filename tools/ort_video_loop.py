@@ -11,13 +11,15 @@ Per tracked frame::
         -> object_pointer -> memory_encoder -> memory bank
 
 The command line runs the bedroom clip forward from a click on frame 0 and in reverse
-from a click on frame 30 (the prompts of ``tools/dump_reference.py``), and compares every
-frame with a reference: the official package's dump at 1024, or this repo's torch
-``VideoPredictor`` run at the same size otherwise (torch is imported for that comparison
-only, after the loop has run)::
+from a click on frame 30 (the prompts of ``tools/dump_reference.py``), then forward from
+a box on frame 0 and from a mask prompt on frame 0 (the reference's own click prediction,
+binarised), and compares every frame with a reference: the official package's dump at
+1024 for the two click runs, this repo's torch ``VideoPredictor`` at the same size
+otherwise (torch is imported for that comparison only, after the loop has run)::
 
-    python tools/ort_video_loop.py                       # fp32 graphs, 1024, vs the dump
+    python tools/ort_video_loop.py                       # fp32 graphs, 1024
     python tools/ort_video_loop.py --size 512 --precision shipped --json loop512.json
+    python tools/ort_video_loop.py --size 512 --runs box mask
 """
 
 from __future__ import annotations
@@ -46,12 +48,36 @@ DUMPS = ROOT / "reference_dumps"
 CHECKPOINT = ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt"
 FRAME_SUFFIXES = (".jpg", ".jpeg", ".png")
 
-# The two runs of tools/dump_reference.py: (tag, frame, points (x, y) in video pixels,
-# labels, reverse).
-RUNS: tuple[tuple[str, int, list[list[float]], list[int], bool], ...] = (
-    ("fwd", 0, [[210.0, 350.0]], [1], False),
-    ("rev", 30, [[210.0, 350.0]], [1], True),
+
+@dataclass(frozen=True)
+class Prompt:
+    """One prompted frame and a propagation direction.
+
+    ``points`` are (x, y) in video pixels with ``labels`` 1 / 0; ``box`` is (x0, y0, x1,
+    y1) in video pixels and goes before the points. ``mask_from`` names the run whose
+    *reference* prediction on ``frame`` (binarised at video resolution) is the mask prompt
+    instead; such a run has no points and no box.
+    """
+
+    tag: str
+    frame: int
+    points: tuple[tuple[float, float], ...] = ()
+    labels: tuple[int, ...] = ()
+    box: tuple[float, float, float, float] | None = None
+    mask_from: str | None = None
+    reverse: bool = False
+
+
+# "fwd" / "rev" are the two runs of tools/dump_reference.py (the official dump exists for
+# them at 1024). The box is drawn around the click's own frame-0 mask with a margin; the
+# mask run re-prompts frame 0 with the click's reference prediction.
+RUNS: tuple[Prompt, ...] = (
+    Prompt("fwd", 0, ((210.0, 350.0),), (1,)),
+    Prompt("rev", 30, ((210.0, 350.0),), (1,), reverse=True),
+    Prompt("box", 0, box=(175.0, 320.0, 275.0, 395.0)),
+    Prompt("mask", 0, mask_from="fwd"),
 )
+DUMPED = frozenset({"fwd", "rev"})
 
 # Graph precision per role. "shipped" is the browser set (see exports/README.md).
 PRECISION_SETS: dict[str, dict[str, str]] = {
@@ -70,6 +96,9 @@ PRECISION_SETS: dict[str, dict[str, str]] = {
 }
 SUFFIX = {"fp32": ".onnx", "int8": ".int8.onnx", "fp16": ".fp16.onnx"}
 LABEL_PAD = -1
+LABEL_BOX_TL, LABEL_BOX_BR = 2, 3
+# ``SAM2.mask_as_output``: a mask prompt becomes +-10 logits and a +-10 object score.
+MASK_SCALE, MASK_BIAS = 20.0, -10.0
 
 Arrays = dict[str, np.ndarray]
 
@@ -190,6 +219,44 @@ def upsample_bilinear(x: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     x0, x1, wx = _linear_taps(x.shape[-1], size[1])
     rows = x[..., y0, :] * (1 - wy)[:, None] + x[..., y1, :] * wy[:, None]
     out: np.ndarray = rows[..., x0] * (1 - wx) + rows[..., x1] * wx
+    return out.astype(np.float32)
+
+
+def _antialias_weights(n_in: int, n_out: int) -> np.ndarray:
+    """``[n_out, n_in]`` weights of one axis of ``F.interpolate(mode="bilinear",
+    align_corners=False, antialias=True)``: a triangle filter of half-width
+    ``max(n_in / n_out, 1)`` around each destination centre, normalised over the taps
+    inside the image (PyTorch's ``_compute_indices_min_size_weights_aa``). Plain bilinear
+    when enlarging."""
+    scale = n_in / n_out
+    support = max(scale, 1.0)
+    inv = 1.0 / scale if scale >= 1.0 else 1.0
+    w = np.zeros((n_out, n_in), np.float64)
+    for i in range(n_out):
+        center = scale * (i + 0.5)
+        lo = max(int(center - support + 0.5), 0)  # int() truncates like the C++ cast
+        hi = min(int(center + support + 0.5), n_in)
+        j = np.arange(lo, hi)
+        taps = np.maximum(0.0, 1.0 - np.abs((j - center + 0.5) * inv))
+        w[i, lo:hi] = taps / taps.sum()
+    return w.astype(np.float32)
+
+
+def resize_antialias(x: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """``F.interpolate(x, size, mode="bilinear", align_corners=False, antialias=True)``
+    for ``[..., h, w]`` (separable: rows, then columns, float32)."""
+    wy = _antialias_weights(x.shape[-2], size[0])
+    wx = _antialias_weights(x.shape[-1], size[1])
+    out: np.ndarray = (wy @ x.astype(np.float32)) @ wx.T
+    return out.astype(np.float32)
+
+
+def mask_downsample(mask: np.ndarray, weight: np.ndarray, bias: np.ndarray) -> np.ndarray:
+    """``SAM2.mask_downsample``: the learned 4x4 stride-4 conv, ``[..., S, S]`` ->
+    ``[..., S / 4, S / 4]`` (a mask prompt as the head's ``mask_input``)."""
+    s = mask.shape[-1] // 4
+    x = mask.reshape(*mask.shape[:-2], s, 4, s, 4)
+    out: np.ndarray = np.einsum("...iajb,ab->...ij", x, weight.reshape(4, 4)) + bias.reshape(())
     return out.astype(np.float32)
 
 
@@ -490,16 +557,30 @@ class OrtVideoTracker:
     # ---------------------------------------------------------------- prompts / propagate
 
     def add_click(
-        self, frame: int, points: Sequence[Sequence[float]], labels: Sequence[int]
+        self,
+        frame: int,
+        points: Sequence[Sequence[float]],
+        labels: Sequence[int],
+        box: Sequence[float] | None = None,
     ) -> np.ndarray:
-        """``VideoPredictor.add_points`` with ``clear_old_points=True`` and no box.
+        """``VideoPredictor.add_points`` with ``clear_old_points=True``.
 
-        ``points`` are (x, y) in video pixels. Returns the low-res logits.
+        ``points`` are (x, y) in video pixels (labels 1 / 0); an optional ``box`` (x0, y0,
+        x1, y1), also in video pixels, becomes two leading points with labels 2 and 3. A
+        mask prompt on the frame is replaced. Returns the low-res logits.
         """
         h, w = self.video_hw
-        xy = np.asarray(points, np.float32).reshape(1, -1, 2)
+        xy = np.asarray(points, np.float32).reshape(-1, 2)
+        labs = np.asarray(labels, np.int32).reshape(-1)
+        if xy.shape[0] != labs.shape[0]:
+            raise ValueError("points and labels differ in length")
+        if box is not None:
+            xy = np.concatenate([np.asarray(box, np.float32).reshape(2, 2), xy])
+            labs = np.concatenate([np.array([LABEL_BOX_TL, LABEL_BOX_BR], np.int32), labs])
+        if xy.shape[0] == 0:
+            raise ValueError("a point prompt needs at least one point or a box")
+        xy, labs = xy[None], labs[None]
         coords = (xy / np.array([w, h], np.float32) * np.float32(self.size)).astype(np.float32)
-        labs = np.asarray(labels, np.int32).reshape(1, -1)
         self.points[frame] = (coords, labs)
         prior = self.pending.get(frame) or self.cond.get(frame) or self.non_cond.get(frame)
         clamp = float(self.c.mask_input_clamp)
@@ -512,6 +593,62 @@ class OrtVideoTracker:
         self.pending[frame] = FrameOutput(low, ptr, score)
         return low
 
+    def add_mask(self, frame: int, mask: np.ndarray) -> np.ndarray:
+        """``VideoPredictor.add_mask`` + ``SAM2.mask_as_output``: a binary ``mask [H, W]``
+        is taken as the frame's prediction instead of being re-predicted.
+
+        Any size: resized to S x S (antialiased bilinear, threshold 0.5). The high-res
+        logits are ``mask * 20 - 10``, the low-res ones their antialiased downsample by 4,
+        and the score is 10 (any pixel set) or -10. The SAM head runs only for the object
+        pointer: no points, the mask through the learned ``mask_downsample`` conv as the
+        dense prompt, and the learned no-object pointer when the mask is empty. Clicks on
+        the frame are discarded; the memory is not conditioned (as for an initial click).
+        Returns the low-res logits.
+        """
+        m = np.asarray(mask, bool)
+        if m.ndim != 2:
+            raise ValueError("mask must be [H, W]")
+        s = self.size
+        m_in = m.astype(np.float32)[None, None]
+        if m_in.shape[-2:] != (s, s):
+            m_in = (resize_antialias(m_in, (s, s)) >= 0.5).astype(np.float32)
+        high_res = (m_in * np.float32(MASK_SCALE) + np.float32(MASK_BIAS)).astype(np.float32)
+        low = resize_antialias(high_res, (s // 4, s // 4))
+        feats = self.features(frame)
+        head = self._timed(
+            "sam_head",
+            self.g.sam_head,
+            {
+                "image_embed": feats.image_embed,
+                "high_res_feat_s0": feats.high_res_feat_s0,
+                "high_res_feat_s1": feats.high_res_feat_s1,
+                "point_coords": np.zeros((1, 1, 2), np.float32),
+                "point_labels": np.full((1, 1), LABEL_PAD, np.int32),
+                "mask_input": mask_downsample(
+                    m_in,
+                    np.asarray(self.c.mask_downsample_weight, np.float32),
+                    np.asarray(self.c.mask_downsample_bias, np.float32),
+                ),
+                "has_mask_input": np.ones((1,), np.float32),
+            },
+        )
+        is_obj = bool(m_in.any())
+        if is_obj:
+            ptr = self._timed(
+                "object_pointer",
+                self.g.object_pointer,
+                {
+                    "mask_token": head["sam_tokens"][:, 0].astype(np.float32),
+                    "object_score_logits": head["object_score_logits"],
+                },
+            )["obj_ptr"]
+        else:
+            ptr = np.asarray(self.c.no_obj_ptr, np.float32)[None]
+        score = np.array([[MASK_SCALE * float(is_obj) + MASK_BIAS]], np.float32)
+        self.points.pop(frame, None)
+        self.pending[frame] = FrameOutput(low, ptr, score)
+        return low
+
     def _preflight(self) -> None:
         """``VideoPredictor._preflight``: encode prompted frames, make them conditioning."""
         for frame, out in sorted(self.pending.items()):
@@ -521,7 +658,7 @@ class OrtVideoTracker:
             self.non_cond.pop(frame, None)
         self.pending.clear()
         if not self.cond:
-            raise ValueError("add a click before propagating")
+            raise ValueError("add a prompt before propagating")
 
     def propagate(
         self, start: int | None = None, reverse: bool = False
@@ -580,17 +717,18 @@ def track(
     consts: Constants,
     frames: np.ndarray,
     video_hw: tuple[int, int],
-    click_frame: int,
-    points: Sequence[Sequence[float]],
-    labels: Sequence[int],
-    reverse: bool,
+    prompt: Prompt,
+    mask: np.ndarray | None = None,
     bf16_memory: bool = True,
     encoder_cache: dict[int, Features] | None = None,
 ) -> tuple[dict[int, FrameOutput], Timings]:
-    """Click once on ``click_frame`` and propagate through the clip in one direction."""
+    """Prompt one frame (``mask`` for a mask run) and propagate in ``prompt``'s direction."""
     tracker = OrtVideoTracker(graphs, consts, frames, video_hw, bf16_memory, encoder_cache)
-    tracker.add_click(click_frame, points, labels)
-    outputs = dict(tracker.propagate(reverse=reverse))
+    if mask is not None:
+        tracker.add_mask(prompt.frame, mask)
+    else:
+        tracker.add_click(prompt.frame, prompt.points, prompt.labels, prompt.box)
+    outputs = dict(tracker.propagate(reverse=prompt.reverse))
     return outputs, tracker.timings
 
 
@@ -625,33 +763,43 @@ def dump_reference(tag: str) -> Reference:
     )
 
 
-def torch_reference(
-    size: int,
-    frames: Sequence[np.ndarray],
-    click_frame: int,
-    points: Sequence[Sequence[float]],
-    labels: Sequence[int],
-    reverse: bool,
-    model: Any = None,
-) -> Reference:
-    """This repo's torch ``VideoPredictor`` (exact parity with the official package at
-    1024) run at ``size`` on HWC uint8 ``frames``."""
+def torch_model(size: int) -> Any:
+    """The tiny checkpoint as this repo's torch ``SAM2`` at input size ``size``."""
     import dataclasses
-
-    import torch
 
     from sam2_scratch.configs import TINY
     from sam2_scratch.model import SAM2
+
+    return SAM2.from_checkpoint(CHECKPOINT, dataclasses.replace(TINY, image_size=size))
+
+
+def torch_reference(
+    size: int,
+    frames: Sequence[np.ndarray],
+    prompt: Prompt,
+    mask: np.ndarray | None = None,
+    model: Any = None,
+) -> Reference:
+    """This repo's torch ``VideoPredictor`` (exact parity with the official package at
+    1024) run at ``size`` on HWC uint8 ``frames`` with ``prompt`` (``mask`` for a mask run)."""
+    import torch
+
     from sam2_scratch.video_predictor import VideoPredictor
 
     if model is None:
-        model = SAM2.from_checkpoint(CHECKPOINT, dataclasses.replace(TINY, image_size=size))
+        model = torch_model(size)
     predictor = VideoPredictor(model)
     with torch.no_grad():
         state = predictor.init_state(list(frames))
-        predictor.add_points(state, click_frame, 1, points, labels)
+        if mask is not None:
+            predictor.add_mask(state, prompt.frame, 1, mask)
+        else:
+            points = [list(p) for p in prompt.points] or None
+            labels = list(prompt.labels) or None
+            box = None if prompt.box is None else list(prompt.box)
+            predictor.add_points(state, prompt.frame, 1, points, labels, box=box)
         ref = Reference({}, {}, {})
-        for frame, per_obj, _ in predictor.propagate(state, reverse=reverse):
+        for frame, per_obj, _ in predictor.propagate(state, reverse=prompt.reverse):
             out = state.objects[1].output
             fo = out["non_cond_frame_outputs"].get(frame) or out["cond_frame_outputs"][frame]
             ref.pred_masks[frame] = per_obj[1].numpy()
@@ -702,11 +850,12 @@ def evaluate(
     exports: Path = EXPORTS,
     max_frames: int | None = None,
     bf16_memory: bool = True,
-    runs: Sequence[tuple[str, int, list[list[float]], list[int], bool]] = RUNS,
+    runs: Sequence[Prompt] = RUNS,
     references: dict[str, Reference] | None = None,
 ) -> dict[str, Any]:
     """Run every prompt of ``runs`` through the ORT loop and compare with the reference
-    (the dump at 1024 on the full clip, else the torch predictor at ``size``)."""
+    (the dump at 1024 on the full clip for the click runs, else the torch predictor at
+    ``size``). A mask run's prompt is derived from the reference of the run it names."""
     graphs = Graphs.load(exports, size, precisions)
     consts = Constants.load(exports / f"constants_{size}.json")
     clip = raw_frames(VIDEO_DIR, max_frames)
@@ -721,32 +870,46 @@ def evaluate(
         "files": {k: v.name for k, v in graphs.files.items()},
         "bf16_memory": bf16_memory,
         "num_frames": int(frames.shape[0]),
-        "reference": "official sam2 dump" if use_dump else f"torch VideoPredictor at {size}",
+        "reference": (
+            f"official sam2 dump (clicks), torch VideoPredictor at {size} (box, mask)"
+            if use_dump
+            else f"torch VideoPredictor at {size}"
+        ),
         "runs": {},
     }
-    references = references if references is not None else {}
+    refs = references if references is not None else {}
+    by_tag = {p.tag: p for p in (*RUNS, *runs)}
     model = None
-    for tag, frame, points, labels, reverse in runs:
-        if frame >= frames.shape[0]:
-            continue
-        outputs, timings = track(
-            graphs, consts, frames, hw, frame, points, labels, reverse, bf16_memory, cache
-        )
-        if tag not in references:
-            if use_dump:
-                references[tag] = dump_reference(tag)
+
+    def reference(tag: str) -> Reference:
+        nonlocal model
+        if tag not in refs:
+            prompt = by_tag[tag]
+            if use_dump and tag in DUMPED:
+                refs[tag] = dump_reference(tag)
             else:
                 if model is None:
-                    import dataclasses
+                    model = torch_model(size)
+                refs[tag] = torch_reference(size, clip, prompt, mask_prompt(prompt), model)
+        return refs[tag]
 
-                    from sam2_scratch.configs import TINY
-                    from sam2_scratch.model import SAM2
+    def mask_prompt(prompt: Prompt) -> np.ndarray | None:
+        """The reference prediction of ``prompt.mask_from`` on ``prompt.frame``, at video
+        resolution and binarised: the mask a user would hand in."""
+        if prompt.mask_from is None:
+            return None
+        low = reference(prompt.mask_from).pred_masks[prompt.frame]
+        binary: np.ndarray = upsample_bilinear(low, hw)[0, 0] > 0
+        return binary
 
-                    model = SAM2.from_checkpoint(
-                        CHECKPOINT, dataclasses.replace(TINY, image_size=size)
-                    )
-                references[tag] = torch_reference(size, clip, frame, points, labels, reverse, model)
-        ref = references[tag]
+    for prompt in runs:
+        tag = prompt.tag
+        if prompt.frame >= frames.shape[0]:
+            continue
+        outputs, timings = track(
+            graphs, consts, frames, hw, prompt, mask_prompt(prompt), bf16_memory, cache
+        )
+        ref = reference(tag)
         entry = compare(outputs, ref)
         if ref.input_frames is not None:
             entry["frame_load_err"] = float(np.abs(frames - ref.input_frames).max())
@@ -787,14 +950,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-bf16", action="store_true", help="keep fp32 memory features")
     parser.add_argument("--exports", type=Path, default=EXPORTS)
     parser.add_argument("--json", type=Path, help="write the summary here")
+    parser.add_argument(
+        "--runs", nargs="+", choices=[p.tag for p in RUNS], help="only these prompts"
+    )
     args = parser.parse_args(argv)
     precisions = dict(PRECISION_SETS[args.precision])
     for role in precisions:
         override = getattr(args, role)
         if override:
             precisions[role] = override
+    runs = RUNS if args.runs is None else tuple(p for p in RUNS if p.tag in args.runs)
     result = evaluate(
-        args.size, precisions, args.exports, args.max_frames, bf16_memory=not args.no_bf16
+        args.size,
+        precisions,
+        args.exports,
+        args.max_frames,
+        bf16_memory=not args.no_bf16,
+        runs=runs,
     )
     _print(result)
     if args.json:

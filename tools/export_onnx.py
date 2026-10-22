@@ -977,6 +977,10 @@ def video_constants(sam: TorchSam, size: int) -> dict[str, Any]:
         # Folded into the graphs; listed so the loop can be audited without the checkpoint.
         "no_obj_ptr": _floats(mem.no_obj_ptr.reshape(-1)),
         "no_obj_embed_spatial": _floats(mem.no_obj_embed_spatial.reshape(-1)),
+        # [4][4] and [1]: ``SAM2.mask_downsample``, the 4x4 stride-4 conv that turns a mask
+        # prompt (S x S, 0/1) into the head's ``mask_input`` (``mask_as_output``).
+        "mask_downsample_weight": _floats(sam.state_dict["mask_downsample.weight"].reshape(4, 4)),
+        "mask_downsample_bias": _floats(sam.state_dict["mask_downsample.bias"].reshape(-1)),
     }
 
 

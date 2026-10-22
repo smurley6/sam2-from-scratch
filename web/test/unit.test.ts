@@ -205,8 +205,13 @@ describe("misc", () => {
       sigmoid_scale_for_mem_enc: 20, sigmoid_bias_for_mem_enc: -10,
       no_mem_embed: [0.01892760396003723, -0.5], maskmem_tpos_enc: [[0.280518501996994], [1]],
       no_obj_ptr: [1, 2], no_obj_embed_spatial: [3],
+      mask_downsample_weight: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 0.36299964785575867]],
+      mask_downsample_bias: [0.36299964785575867],
     });
     expect(c.no_mem_embed[0]).toBe(0.01892760396003723);
+    expect(Array.from(c.mask_downsample_weight.subarray(0, 5))).toEqual([1, 2, 3, 4, 5]);
+    expect(c.mask_downsample_weight[15]).toBe(0.36299964785575867);
+    expect(c.mask_downsample_bias).toBe(0.36299964785575867);
     expect(c.maskmem_tpos_enc[0]?.[0]).toBe(0.280518501996994);
     expect(c.pixel_mean[0]).toBe(0.485);
     expect(() => parseConstants({ ...JSON.parse("{}") })).toThrow();

@@ -7,7 +7,11 @@ Writes ``exports/browser_reference/``::
 
     clip_blackswan/frames_u8.bin      [T, 512, 512, 3] uint8, PIL-bicubic resized frames
     clip_blackswan/masks.bin          [T, 128, 128] float32 low-res logits, forward run
-    clip_blackswan/meta.json          click, scores, obj_ptr norms, shapes
+    clip_blackswan/masks_box.bin      [T, 128, 128] the same from a box on frame 0
+    clip_blackswan/masks_mask.bin     [T, 128, 128] the same from a mask prompt on frame 0
+    clip_blackswan/mask_prompt_u8.bin [H, W] uint8, that mask prompt (the click run's own
+                                      frame-0 prediction at video resolution)
+    clip_blackswan/meta.json          click, box, scores, obj_ptr norms, shapes
     clip_bmx-trees/frames_u8.bin      [T, 512, 512, 3] uint8
     clip_bmx-trees/masks.bin          [2, T, 128, 128] two objects (rider, bike) tracked
                                       independently, sharing one encoder pass per frame
@@ -46,6 +50,8 @@ CLIPS = ROOT / "bundle" / "clips"
 # Clicks in 640x360 video pixels: blackswan, one object; bmx-trees, the rider (shirt and
 # shorts) and the bike (both wheels), two independent memory banks over one encoder pass.
 CLICK = {"frame": 0, "points": [[330, 190]], "labels": [1]}  # on the swan
+# The box run draws this margin (video pixels) around the click run's frame-0 mask.
+BOX_MARGIN = 8
 BMX_CLICKS = [
     {"frame": 0, "points": [[340, 150], [335, 185]], "labels": [1, 1]},
     {"frame": 0, "points": [[290, 235], [395, 235]], "labels": [1, 1]},
@@ -75,35 +81,79 @@ def load_clip(name: str, consts: Constants) -> tuple[np.ndarray, np.ndarray, tup
     return u8, frames, (h, w)
 
 
-def dump_clip(graphs: Graphs, consts: Constants) -> None:
-    out = OUT / "clip_blackswan"
-    out.mkdir(parents=True, exist_ok=True)
-    u8, frames, (h, w) = load_clip("blackswan", consts)
-    tracker = OrtVideoTracker(graphs, consts, frames, (h, w))
-    tracker.add_click(CLICK["frame"], CLICK["points"], CLICK["labels"])
+def run_clip(
+    tracker: OrtVideoTracker,
+) -> tuple[np.ndarray, list[float], list[float]]:
+    """Propagate forward; ``([T, m, m]`` low-res logits, scores, pointer norms)``."""
     masks, scores, ptr_norm = [], [], []
     for _frame, fo in tracker.propagate():
         masks.append(fo.pred_masks[0, 0])
         scores.append(float(fo.object_score_logits[0, 0]))
         ptr_norm.append(float(np.linalg.norm(fo.obj_ptr)))
-    masks_arr = np.stack(masks).astype(np.float32)
+    return np.stack(masks).astype(np.float32), scores, ptr_norm
+
+
+def dump_clip(graphs: Graphs, consts: Constants) -> None:
+    """Three forward runs on blackswan over one encoder cache: the click, a box drawn
+    around the click's frame-0 mask, and that mask itself as a mask prompt."""
+    out = OUT / "clip_blackswan"
+    out.mkdir(parents=True, exist_ok=True)
+    u8, frames, (h, w) = load_clip("blackswan", consts)
+    cache: dict[int, Features] = {}
+    tracker = OrtVideoTracker(graphs, consts, frames, (h, w), encoder_cache=cache)
+    tracker.add_click(CLICK["frame"], CLICK["points"], CLICK["labels"])
+    masks_arr, scores, ptr_norm = run_clip(tracker)
+
+    # The click's own frame-0 prediction at video resolution: a box around it, and the
+    # mask prompt (what the demo's "use mask as prompt" hands in).
+    frame0 = tracker.video_res(masks_arr[CLICK["frame"]][None, None])[0, 0] > 0
+    ys, xs = np.nonzero(frame0)
+    box = [
+        float(max(int(xs.min()) - BOX_MARGIN, 0)),
+        float(max(int(ys.min()) - BOX_MARGIN, 0)),
+        float(min(int(xs.max()) + BOX_MARGIN, w - 1)),
+        float(min(int(ys.max()) + BOX_MARGIN, h - 1)),
+    ]
+    box_tracker = OrtVideoTracker(graphs, consts, frames, (h, w), encoder_cache=cache)
+    box_tracker.add_click(CLICK["frame"], [], [], box=box)
+    masks_box, scores_box, _ = run_clip(box_tracker)
+    mask_tracker = OrtVideoTracker(graphs, consts, frames, (h, w), encoder_cache=cache)
+    mask_tracker.add_mask(CLICK["frame"], frame0)
+    masks_mask, scores_mask, _ = run_clip(mask_tracker)
+
     u8.tofile(out / "frames_u8.bin")
     masks_arr.tofile(out / "masks.bin")
+    masks_box.tofile(out / "masks_box.bin")
+    masks_mask.tofile(out / "masks_mask.bin")
+    frame0.astype(np.uint8).tofile(out / "mask_prompt_u8.bin")
     area = [float((m > 0).mean()) for m in masks_arr]
     meta = {
         "size": SIZE,
         "video_hw": [h, w],
         "num_frames": len(frames),
         "click": CLICK,
+        "box": {"frame": CLICK["frame"], "box": box},
+        "mask_prompt": {"frame": CLICK["frame"], "shape": [h, w], "file": "mask_prompt_u8.bin"},
         "frames_u8_shape": list(u8.shape),
         "masks_shape": list(masks_arr.shape),
         "object_score_logits": scores,
+        "object_score_logits_box": scores_box,
+        "object_score_logits_mask": scores_mask,
         "obj_ptr_norm": ptr_norm,
         "mask_area_fraction": area,
+        "mask_area_fraction_box": [float((m > 0).mean()) for m in masks_box],
+        "mask_area_fraction_mask": [float((m > 0).mean()) for m in masks_mask],
         "precisions": PRECISIONS,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"clip: frames {len(frames)} area frame0 {area[0]:.3f} min {min(area):.3f}")
+    iou = [
+        float(((a > 0) & (b > 0)).sum() / max(1, ((a > 0) | (b > 0)).sum()))
+        for a, b in zip(masks_arr, masks_mask, strict=True)
+    ]
+    print(
+        f"clip: frames {len(frames)} area frame0 {area[0]:.3f} min {min(area):.3f}; "
+        f"box {box}; mask run vs click run IoU min {min(iou):.3f}"
+    )
 
 
 def dump_multi_clip(graphs: Graphs, consts: Constants) -> None:

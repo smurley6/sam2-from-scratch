@@ -95,8 +95,12 @@ export interface SessionSet extends ImageSessionSet {
 export type GraphRole = keyof SessionSet;
 export type Provider = "webgpu" | "wasm";
 
-/** Shipped file per graph at size S (int8 encoder, fp32 head and memory graphs). */
-export function graphFiles(size = 512): Record<GraphRole, string> {
+/**
+ * Shipped file per graph at size S (int8 encoder, fp32 head and memory graphs). `files`
+ * overrides individual names, for a site that serves content-addressed copies (a manifest
+ * of hashed names) under the same roles.
+ */
+export function graphFiles(size = 512, files: Partial<Record<GraphRole, string>> = {}): Record<GraphRole, string> {
   return {
     imageEncoder: `image_encoder_${size}.int8.onnx`,
     samHead: `sam_head_${size}.onnx`,
@@ -104,6 +108,7 @@ export function graphFiles(size = 512): Record<GraphRole, string> {
     memoryAttention: `memory_attention_${size}.onnx`,
     objectPointer: "object_pointer.onnx",
     objectPointerTpos: "object_pointer_tpos.onnx",
+    ...files,
   };
 }
 
@@ -137,7 +142,7 @@ async function createRoles<R extends GraphRole>(
   opts: SessionOptions,
 ): Promise<Record<R, OrtSession>> {
   const ort = getOrt();
-  const files = { ...graphFiles(opts.size), ...opts.files };
+  const files = graphFiles(opts.size, opts.files);
   const out: Partial<Record<R, OrtSession>> = {};
   // Sequential on purpose: one model's bytes are released before the next download.
   for (const role of roles) {

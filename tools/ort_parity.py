@@ -490,8 +490,9 @@ def recorded_memory_calls(
     model = SAM2.from_checkpoint(loop.CHECKPOINT, dataclasses.replace(TINY, image_size=size))
     predictor = VideoPredictor(model)
     state = predictor.init_state(loop.raw_frames())
-    _, frame0, points, labels, reverse = loop.RUNS[0]
-    predictor.add_points(state, frame0, 1, points, labels)
+    first = loop.RUNS[0]
+    frame0, reverse = first.frame, first.reverse
+    predictor.add_points(state, frame0, 1, [list(q) for q in first.points], list(first.labels))
 
     current = {"frame": frame0}
     attn: list[MemoryAttentionCall] = []

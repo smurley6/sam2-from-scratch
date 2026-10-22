@@ -34,6 +34,8 @@ const overlay = maskToImageData(out.lowRes, consts.mask_size, w, h, [30, 144, 25
 const frames = { count, get: async (i) => normalize(resizeToSquare(frame[i], S), S, consts, 4) };
 const tracker = new VideoTracker(sessions, consts, frames, { width, height });
 await tracker.addClick(0, [{ x, y }], [1]);              // video pixels; 1 positive, 0 negative
+await tracker.addClick(0, [], [], { x0, y0, x1, y1 });   // a box (video pixels), alone or with clicks
+await tracker.addMask(0, mask, { height, width });       // a binary mask (any size) as the prompt
 for await (const f of tracker.propagate()) {}            // { frame, lowRes, score, isConditioning }
 for await (const f of tracker.propagate(t, true)) {}     // reverse from frame t
 
@@ -52,11 +54,11 @@ for await (const f of multi.propagate()) {               // { frame, perObject, 
 |--------|----------|
 | `constants.ts` | `Constants`, `parseConstants` (tensors via `Float32Array.from`, bit-exact) |
 | `sessions.ts` | `setOrt`, `createSessions` / `createImageSessions`, `SessionSet`, file names, minimal ORT types |
-| `preprocess.ts` | `normalize` (float64 math, float32 storage), `upsampleBilinear` (half-pixel, float32), `roundBf16` |
+| `preprocess.ts` | `normalize` (float64 math, float32 storage), `upsampleBilinear` (half-pixel, float32), `resizeAntialias` (torch `antialias=True`), `maskDownsample` (the mask prompt conv), `roundBf16` |
 | `features.ts` | `encodeImage`, `withMemoryTokens` (`vision_feat`, `curr`) |
 | `head.ts` | `runHead`, `selectOutput` (multimask / stability / absent-object rules), `clampMaskInput` |
 | `imagePredictor.ts` | `ImagePredictor.setImage` / `predict` (box = leading labels 2 and 3) |
-| `videoTracker.ts` | `VideoTracker`: port of `OrtVideoTracker` in `tools/ort_video_loop.py`; `FrameEncoder`, the per-frame encoder cache |
+| `videoTracker.ts` | `VideoTracker`: port of `OrtVideoTracker` in `tools/ort_video_loop.py` (`addClick` with points and/or a box, `addMask`, `propagate`); `FrameEncoder`, the per-frame encoder cache |
 | `multiObjectTracker.ts` | `MultiObjectTracker`: independent `VideoTracker`s over one `FrameEncoder`, stepped frame by frame; `nonOverlapping` (display rule of `video_predictor.non_overlapping`) |
 | `browser.ts` | `resizeToSquare`, `pickProvider`, `configureOrt`, `fetchLoader`, `maskToImageData` |
 | `index.ts` | re-exports |
@@ -69,7 +71,9 @@ The runtime calls only `InferenceSession.create`, `new Tensor` and `session.run`
 build works; register it once with `setOrt` (`configureOrt` does this in the browser).
 
 A `VideoTracker` (or `MultiObjectTracker`) processes one call at a time: await `addClick`
-and finish (or `break` out of) a `propagate` loop before the next call. Objects in a
+or `addMask` and finish (or `break` out of) a `propagate` loop before the next call. A
+mask prompt (`addMask`) is taken as the frame's prediction, as `VideoPredictor.add_mask`
+does: `+-10` logits, no re-prediction, the head run only for the object pointer. Objects in a
 `MultiObjectTracker` are independent, as in the reference: each memory bank sees its own
 unconstrained mask, and `nonOverlapping` resolves overlaps for display only. Per tracked
 frame the encoder runs once and the memory attention, head and memory encoder once per
@@ -97,15 +101,17 @@ uses and no second ORT build is needed. Node runs with ORT's default thread coun
    `iou_predictions` within 1e-3.
 2. Video parity: `clip_blackswan`, click on frame 0, forward propagation; per-frame IoU
    >= 0.99 at threshold 0 and object score within 0.1. A second test runs a correction
-   click on a tracked frame and a reverse propagation.
+   click on a tracked frame and a reverse propagation. Two more run the same clip from a
+   box on frame 0 and from a mask prompt (the click's frame-0 prediction at video
+   resolution), each against its own Python run.
 3. Multi-object parity: `clip_bmx-trees`, the rider and the bike clicked on frame 0 and
    tracked together by a `MultiObjectTracker`; each object's per-frame IoU >= 0.99 against
    its own single-object Python run, the encoder called once per frame, `nonOverlapping`
    bit-exact against the torch `non_overlapping` of those runs, and an object's masks
    bit-identical to tracking it alone.
 4. Unit tests: output selection branches, bfloat16 rounding, bilinear upsampling (hand
-   cases and a bit-exact numpy case), `normalize` bit-exactness, constants parsing,
-   `nonOverlapping`.
+   cases and a bit-exact numpy case), the antialiased resize and mask conv against numpy,
+   `normalize` bit-exactness, constants parsing, `nonOverlapping`.
 
 ## What the website copies
 

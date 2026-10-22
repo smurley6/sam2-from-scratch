@@ -212,3 +212,24 @@ def test_video_loop_three_frames(exported_video: tuple[TorchSam, Path]) -> None:
     for frame, stats in run["per_frame"].items():
         assert stats["iou"] >= 0.99, (frame, stats)
         assert stats["score_err"] < 1e-2, (frame, stats)
+
+
+def test_video_loop_box_and_mask_three_frames(exported_video: tuple[TorchSam, Path]) -> None:
+    """A box on frame 0 (two leading points, labels 2 and 3) and a mask prompt on frame 0
+    (the torch click prediction, binarised at video resolution) through the ORT loop,
+    against the torch predictor's ``add_points(box=...)`` / ``add_mask`` on 3 frames."""
+    _, out = exported_video
+    consts = loop.Constants.load(out / f"constants_{SIZE}.json")
+    assert np.asarray(consts.mask_downsample_weight).shape == (4, 4)
+    assert np.asarray(consts.mask_downsample_bias).shape == (1,)
+    runs = tuple(p for p in loop.RUNS if p.tag in ("box", "mask"))
+    result = loop.evaluate(SIZE, loop.PRECISION_SETS["fp32"], out, max_frames=3, runs=runs)
+    assert set(result["runs"]) == {"box", "mask"}
+    for tag, run in result["runs"].items():
+        assert run["frames"] == 3, tag
+        for frame, stats in run["per_frame"].items():
+            assert stats["iou"] >= 0.99, (tag, frame, stats)
+            assert stats["score_err"] < 1e-2, (tag, frame, stats)
+    # The mask prompt is taken as the prediction: +-10 logits and a +10 score on frame 0.
+    frame0 = result["runs"]["mask"]["per_frame"][0]
+    assert frame0["score"] == 10.0 and frame0["logit_err"] < 1e-3

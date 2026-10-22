@@ -223,6 +223,30 @@ only; the TypeScript port follows it step by step. Notation: `g = S/16`, `HW = g
 7. `object_pointer(token, score)` -> `obj_ptr`. Keep `{pred_masks [1,1,m,m], obj_ptr,
    score}` as *pending* (no memory yet; further clicks redo 4-7).
 
+**Box on frame `f`**: as a click, with the box corners `(x0, y0)` label 2 and `(x1, y1)`
+label 3 scaled the same way and placed before any clicks (`VideoPredictor.add_points` with
+`box`). The box counts as 2 points for the selection rule, so a box alone is a single-mask
+call. A box replaces a mask prompt on the frame.
+
+**Mask on frame `f`** (`VideoPredictor.add_mask` / `SAM2.mask_as_output`: a binary mask
+`[H, W]` is taken as the prediction instead of being re-predicted; clicks on the frame are
+dropped):
+
+* `m` = the mask resized to `S x S` with an antialiased bilinear filter (triangle filter of
+  half-width `max(src / dst, 1)` per axis, half-pixel centres, weights renormalised at the
+  borders: `F.interpolate(..., antialias=True)`), thresholded at 0.5; a mask already
+  `S x S` is used as is.
+* `pred_masks` = `(m * 20 - 10)` downsampled by 4 with the same antialiased filter
+  (`[1, 1, m, m]`; every value in `[-10, 10]`).
+* `score` = 10 if any pixel of `m` is set, else -10.
+* `obj_ptr`: `sam_head(encoder image_embed, s0, s1, point (0, 0) label -1,
+  mask_input = mask_downsample(m), has_mask_input = 1)` where `mask_downsample` is the
+  checkpoint's 4x4 stride-4 conv (`mask_downsample_weight` / `_bias` in
+  `constants_{S}.json`), then `object_pointer(sam_tokens[0], object_score_logits)`; when
+  the mask is empty the pointer is the learned `no_obj_ptr` instead. The memory is never
+  consulted here, even on a frame that was already tracked.
+* The frame is *pending* like a clicked one: step 8 encodes it with `binarize = 1`.
+
 **Start of propagation**
 
 8. Each pending frame (ascending): `high_res = upsample(pred_masks, S)` (bilinear,
@@ -263,11 +287,9 @@ is yielded with its stored prediction and not re-tracked)
 **Deviations from `video_predictor.py`**: one object per loop (several objects run as
 independent loops over one encoder pass per frame, `web/src/multiObjectTracker.ts`, where
 the torch side batches them; overlaps are resolved for display by the same
-`non_overlapping` rule); no mask prompt (`add_mask`) and no box in
-`add_click` (the head accepts a box as labels 2 and 3, so adding it is mechanical);
-`clear_old_points` is always true. Everything else, including corrections on tracked
-frames and the general frame-selection rules (`max_cond_frames_in_attn`, temporal
-stride), mirrors the torch code. In the browser, canvas resizing is not PIL bicubic;
+`non_overlapping` rule) and `clear_old_points` is always true. Everything else, including
+box and mask prompts, corrections on tracked frames and the general frame-selection rules
+(`max_cond_frames_in_attn`, temporal stride), mirrors the torch code. In the browser, canvas resizing is not PIL bicubic;
 that changes the encoder input slightly and is outside this parity check.
 
 ## Parity: image half (tiny, ORT 1.31 CPU provider vs torch fp32)

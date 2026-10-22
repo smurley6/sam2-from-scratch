@@ -54,13 +54,41 @@ def davis_comparison() -> None:
     x = range(len(names))
     w = 0.36
     paper_vals = [PAPER_JF[n] for n in names]
-    ax.bar([i - w / 2 for i in x], paper_vals, w, color=PAPER, label="SAM 2 paper (A100, internal data)")
+    ax.bar(
+        [i - w / 2 for i in x],
+        paper_vals,
+        w,
+        color=PAPER,
+        label="SAM 2 paper (A100, internal data)",
+    )
     for i, n in enumerate(names):
         r = ours.get(n)
         if r:
-            ax.bar(i + w / 2, r["J&F"], w, color=ACCENT, label="This reimplementation (SAM 2.1 weights)" if i == 0 else None)
-            ax.text(i + w / 2, r["J&F"] + 0.25, f"{r['J&F']:.1f}", ha="center", va="bottom", fontsize=9, color=INK)
-        ax.text(i - w / 2, PAPER_JF[n] + 0.25, f"{PAPER_JF[n]:.1f}", ha="center", va="bottom", fontsize=9, color=MUTED)
+            ax.bar(
+                i + w / 2,
+                r["J&F"],
+                w,
+                color=ACCENT,
+                label="This reimplementation (SAM 2.1 weights)" if i == 0 else None,
+            )
+            ax.text(
+                i + w / 2,
+                r["J&F"] + 0.25,
+                f"{r['J&F']:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color=INK,
+            )
+        ax.text(
+            i - w / 2,
+            PAPER_JF[n] + 0.25,
+            f"{PAPER_JF[n]:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color=MUTED,
+        )
     ax.set_xticks(list(x))
     ax.set_xticklabels(names)
     ax.set_ylim(80, 93)

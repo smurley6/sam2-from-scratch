@@ -99,6 +99,16 @@ pass, not as one batch); mobile-phone performance targets.
 
 ## Change log
 
+- 2026-10-22 (box and mask prompts): `OrtVideoTracker.add_click` takes a box (two leading
+  points, labels 2 and 3) and `add_mask` reproduces `VideoPredictor.add_mask` /
+  `SAM2.mask_as_output` (antialiased resize, +-10 logits, head run only for the pointer with
+  the checkpoint's `mask_downsample` conv, now in `constants_{S}.json`). Parity vs the torch
+  predictor on bedroom, 512 fp32: box and mask runs IoU 1.0 on all 48 frames; at 1024 the
+  mask run is 1.0 on 47 frames and 0.9964 on frame 37 (one low-res pixel with a logit
+  within 1e-3 of zero on both sides). The TypeScript runtime gained `addClick(..., box)`,
+  `addMask`, `resizeAntialias` and `maskDownsample`; the browser reference adds a box run
+  and a mask run on blackswan for the Node parity tests.
+
 - 2026-10-22 (multi-object): the browser runtime tracks several objects at once:
   `web/src/multiObjectTracker.ts` (one `VideoTracker` memory bank per object over a shared
   `FrameEncoder`, stepped frame by frame; `nonOverlapping` mirrors

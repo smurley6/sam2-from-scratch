@@ -1,8 +1,8 @@
 import type { Constants } from "./constants";
 import { encodeImage, withMemoryTokens, type FrameFeatures } from "./features";
 import { clampMaskInput, LABEL_PAD, runHead, selectOutput } from "./head";
-import type { Point } from "./imagePredictor";
-import { roundBf16, upsampleBilinear } from "./preprocess";
+import type { Box, Point } from "./imagePredictor";
+import { maskDownsample, resizeAntialias, roundBf16, upsampleBilinear } from "./preprocess";
 import { f32, i64, runGraph, type SessionSet, type Timings } from "./sessions";
 
 /** Normalised `[3, S, S]` frames, decoded on demand. */
@@ -57,6 +57,12 @@ export interface VideoSize {
 
 /** Python `//` for integers. */
 const floorDiv = (a: number, b: number): number => Math.floor(a / b);
+
+const LABEL_BOX_TL = 2;
+const LABEL_BOX_BR = 3;
+/** `SAM2.mask_as_output`: a mask prompt becomes +-10 logits and a +-10 object score. */
+const MASK_SCALE = 20;
+const MASK_BIAS = -10;
 
 /**
  * The image encoder over a clip, run once per frame: a one-frame cache (the frame being
@@ -344,37 +350,127 @@ export class VideoTracker {
   // ------------------------------------------------------------------ prompts / propagate
 
   /**
-   * Clicks on `frame` (replacing earlier clicks there); points in video pixels, labels
-   * 1 positive / 0 negative. A frame that was tracked before is a correction, conditioned
-   * on memory in the direction it was last tracked. Returns the frame's new prediction.
+   * Clicks and/or a box on `frame` (replacing earlier prompts there); points and box in
+   * video pixels, labels 1 positive / 0 negative. The box becomes two leading points
+   * labelled 2 and 3 (so a box alone is a single-mask call). A frame that was tracked
+   * before is a correction, conditioned on memory in the direction it was last tracked.
+   * Returns the frame's new prediction.
    */
   async addClick(
     frame: number,
     points: readonly Point[],
     labels: readonly number[],
+    box?: Box,
   ): Promise<{ lowRes: Float32Array; score: number }> {
-    if (points.length === 0 || points.length !== labels.length) {
-      throw new Error("addClick: need at least one point and one label per point");
+    if (points.length !== labels.length) throw new Error("addClick: one label per point");
+    if (points.length === 0 && box === undefined) {
+      throw new Error("addClick: need at least one point or a box");
     }
     this.#enter();
     try {
       const f = Math.fround;
       const S = f(this.size);
       const { width: w, height: h } = this.videoSize;
-      const coords = new Float32Array(points.length * 2);
-      points.forEach((p, i) => {
-        coords[2 * i] = f(f(p.x) / f(w)) * S;
-        coords[2 * i + 1] = f(f(p.y) / f(h)) * S;
-      });
+      const xy: number[] = [];
+      const labs: number[] = [];
+      if (box !== undefined) {
+        xy.push(box.x0, box.y0, box.x1, box.y1);
+        labs.push(LABEL_BOX_TL, LABEL_BOX_BR);
+      }
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i] as Point;
+        xy.push(p.x, p.y);
+        labs.push(labels[i] as number);
+      }
+      const coords = new Float32Array(xy.length);
+      for (let i = 0; i < xy.length; i += 2) {
+        coords[i] = f(f(xy[i] as number) / f(w)) * S;
+        coords[i + 1] = f(f(xy[i + 1] as number) / f(h)) * S;
+      }
       const prior = this.#pending.get(frame) ?? this.#cond.get(frame) ?? this.#nonCond.get(frame);
       const maskInput =
         prior === undefined ? null : clampMaskInput(prior.predMasks, this.consts.mask_input_clamp);
       const isInit = !this.#tracked.has(frame);
       const reverse = isInit ? false : (this.#tracked.get(frame) as boolean);
       const embed = await this.condition(frame, isInit, reverse);
-      const out = await this.samHead(embed, await this.features(frame), coords, labels, maskInput);
+      const out = await this.samHead(embed, await this.features(frame), coords, labs, maskInput);
       this.#pending.set(frame, out);
       return { lowRes: out.predMasks, score: out.score };
+    } finally {
+      this.#busy = false;
+    }
+  }
+
+  /**
+   * A mask prompt on `frame` (`VideoPredictor.add_mask` / `SAM2.mask_as_output`): the
+   * binary mask is taken as the frame's prediction instead of being re-predicted, and
+   * replaces any clicks there. `mask` holds one value per pixel, row-major, foreground
+   * where `> 0` (so low-res logits, a video-resolution mask or 0/1 bytes all work); `size`
+   * is its height and width, or omitted for a square mask. Any size: it is resized to
+   * S x S (antialiased bilinear, threshold 0.5). The low-res logits are `mask * 20 - 10`
+   * antialias-downsampled by 4, the score is 10 (any pixel set) or -10, and the SAM head
+   * runs only for the object pointer, with the mask (through the learned stride-4 conv) as
+   * its dense prompt and no points; an empty mask gets the learned no-object pointer. The
+   * memory is not consulted, even on a frame that was already tracked.
+   */
+  async addMask(
+    frame: number,
+    mask: ArrayLike<number>,
+    size?: VideoSize,
+  ): Promise<{ lowRes: Float32Array; score: number }> {
+    const side = Math.round(Math.sqrt(mask.length));
+    const h = size?.height ?? side;
+    const w = size?.width ?? side;
+    if (mask.length !== h * w || h <= 0 || w <= 0) {
+      throw new Error(`addMask: ${mask.length} values do not form a ${h} x ${w} mask`);
+    }
+    this.#enter();
+    try {
+      const S = this.size;
+      const c = this.consts;
+      const binary = new Float32Array(h * w);
+      for (let i = 0; i < binary.length; i++) binary[i] = (mask[i] as number) > 0 ? 1 : 0;
+      let m = binary;
+      if (h !== S || w !== S) {
+        const soft = resizeAntialias(binary, { height: h, width: w }, S);
+        m = new Float32Array(S * S);
+        for (let i = 0; i < m.length; i++) m[i] = (soft[i] as number) >= 0.5 ? 1 : 0;
+      }
+      let isObj = false;
+      const highRes = new Float32Array(S * S);
+      for (let i = 0; i < m.length; i++) {
+        if ((m[i] as number) > 0) isObj = true;
+        highRes[i] = (m[i] as number) * MASK_SCALE + MASK_BIAS;
+      }
+      const lowRes = resizeAntialias(highRes, S, c.mask_size);
+      const feats = await this.features(frame);
+      const head = await runHead(
+        this.sessions,
+        feats,
+        [0, 0],
+        [LABEL_PAD],
+        maskDownsample(m, S, c.mask_downsample_weight, c.mask_downsample_bias),
+        this.timings,
+      );
+      let objPtr: Float32Array;
+      if (isObj) {
+        const dim = head.tokens.length / 4;
+        const ptr = await runGraph(
+          this.sessions.objectPointer,
+          {
+            mask_token: f32(head.tokens.slice(0, dim), [1, dim]),
+            object_score_logits: f32(Float32Array.of(head.score), [1, 1]),
+          },
+          this.timings,
+          "object_pointer",
+        );
+        objPtr = ptr["obj_ptr"] as Float32Array;
+      } else {
+        objPtr = c.no_obj_ptr.slice();
+      }
+      const score = isObj ? MASK_SCALE + MASK_BIAS : MASK_BIAS;
+      this.#pending.set(frame, { predMasks: lowRes, objPtr, score, maskmemFeatures: null });
+      return { lowRes, score };
     } finally {
       this.#busy = false;
     }
@@ -390,7 +486,7 @@ export class VideoTracker {
       this.#nonCond.delete(frame);
     }
     this.#pending.clear();
-    if (this.#cond.size === 0) throw new Error("add a click before propagating");
+    if (this.#cond.size === 0) throw new Error("add a prompt before propagating");
   }
 
   /**
@@ -440,7 +536,7 @@ export class VideoTracker {
     };
   }
 
-  /** Frames with clicks (conditioning frames plus clicks not yet propagated), ascending. */
+  /** Prompted frames (conditioning frames plus prompts not yet propagated), ascending. */
   get promptedFrames(): number[] {
     return [...new Set([...this.#cond.keys(), ...this.#pending.keys()])].sort((a, b) => a - b);
   }
@@ -453,7 +549,7 @@ export class VideoTracker {
     return this.#busy;
   }
 
-  /** Forget every click and memory (keeps the encoder cache). */
+  /** Forget every prompt and memory (keeps the encoder cache). */
   reset(): void {
     if (this.#busy) throw new Error("VideoTracker: busy");
     this.#cond.clear();

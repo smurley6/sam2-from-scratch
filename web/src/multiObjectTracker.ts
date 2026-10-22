@@ -1,5 +1,5 @@
 import type { Constants } from "./constants";
-import type { Point } from "./imagePredictor";
+import type { Box, Point } from "./imagePredictor";
 import type { SessionSet, Timings } from "./sessions";
 import {
   FrameEncoder,
@@ -99,17 +99,34 @@ export class MultiObjectTracker {
 
   // ------------------------------------------------------------------ prompts / propagate
 
-  /** Clicks for one object on `frame`: see `VideoTracker.addClick`. */
+  /** Clicks and/or a box for one object on `frame`: see `VideoTracker.addClick`. */
   async addClick(
     objId: number,
     frame: number,
     points: readonly Point[],
     labels: readonly number[],
+    box?: Box,
   ): Promise<{ lowRes: Float32Array; score: number }> {
     const tracker = this.#object(objId);
     this.#enter();
     try {
-      return await tracker.addClick(frame, points, labels);
+      return await tracker.addClick(frame, points, labels, box);
+    } finally {
+      this.#busy = false;
+    }
+  }
+
+  /** A mask prompt for one object on `frame`: see `VideoTracker.addMask`. */
+  async addMask(
+    objId: number,
+    frame: number,
+    mask: ArrayLike<number>,
+    size?: VideoSize,
+  ): Promise<{ lowRes: Float32Array; score: number }> {
+    const tracker = this.#object(objId);
+    this.#enter();
+    try {
+      return await tracker.addMask(frame, mask, size);
     } finally {
       this.#busy = false;
     }
@@ -126,7 +143,7 @@ export class MultiObjectTracker {
     const gens: [number, AsyncGenerator<TrackedFrame, void, void>][] = [];
     try {
       const prompted = [...this.#objects].filter(([, t]) => t.hasPrompts);
-      if (prompted.length === 0) throw new Error("add a click before propagating");
+      if (prompted.length === 0) throw new Error("add a prompt before propagating");
       const first = start ?? Math.min(...prompted.map(([, t]) => t.promptedFrames[0] as number));
       for (const [id, t] of prompted) gens.push([id, t.propagate(first, reverse)]);
       for (;;) {
