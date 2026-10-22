@@ -1,14 +1,18 @@
-# ONNX exports (SAM 2.1 Hiera-T, image half)
+# ONNX exports (SAM 2.1 Hiera-T)
 
-The `.onnx` files are build outputs (gitignored). Regenerate and check them with:
+The `.onnx` and `constants_*.json` files are build outputs (gitignored). Regenerate and
+check them with:
 
 ```sh
-python tools/export_onnx.py --model tiny      # writes the eight files below (about 30 s)
-python tools/ort_parity.py --model tiny       # parity + latency table vs the torch modules
+python tools/export_onnx.py --model tiny      # writes every file below (about 20 s)
+python tools/ort_parity.py --model tiny       # parity + latency tables (image + video, ~15 min)
+python tools/ort_parity.py --parts video --sizes 512   # video rows at one size only
+python tools/ort_video_loop.py --size 512 --precision shipped   # the ORT-only video loop
 ```
 
 All graphs: opset 17, legacy TorchScript exporter (`dynamo=False`), simplified with
-onnxslim, batch 1, fp32 inputs and outputs. Metadata props `graph`, `model`, `image_size`.
+onnxslim, batch 1, fp32 inputs and outputs. Metadata props `graph`, `model`, and
+`image_size` (not on the two size-independent pointer graphs).
 
 | File | Graph | Weights | Size | Shipped |
 |------|-------|---------|-----:|:-------:|
@@ -20,12 +24,26 @@ onnxslim, batch 1, fp32 inputs and outputs. Metadata props `graph`, `model`, `im
 | `sam_head_1024.fp16.onnx` | same | fp16 | 10.6 MB | yes |
 | `sam_head_512.onnx` | prompt encoder + mask decoder, S = 512 | fp32 | 17.9 MB | fallback |
 | `sam_head_512.fp16.onnx` | same | fp16 | 9.0 MB | yes |
+| `memory_encoder_1024.onnx` | memory encoder, S = 1024 | fp32 | 6.6 MB | fallback |
+| `memory_encoder_1024.fp16.onnx` | same | fp16 | 3.3 MB | yes |
+| `memory_encoder_512.onnx` | memory encoder, S = 512 | fp32 | 5.9 MB | fallback |
+| `memory_encoder_512.fp16.onnx` | same | fp16 | 2.9 MB | yes |
+| `memory_attention_1024.onnx` | memory attention, S = 1024 | fp32 | 24.0 MB | fallback |
+| `memory_attention_1024.fp16.onnx` | same | fp16 | 12.1 MB | yes |
+| `memory_attention_512.onnx` | memory attention, S = 512 | fp32 | 23.9 MB | fallback |
+| `memory_attention_512.fp16.onnx` | same | fp16 | 12.0 MB | yes |
+| `object_pointer.onnx` | pointer projection + occlusion switch, any S | fp32 | 0.8 MB | yes |
+| `object_pointer_tpos.onnx` | pointer temporal encoding, any S | fp32 | 0.07 MB | yes |
+| `constants_1024.json`, `constants_512.json` | loop constants (see below) | JSON | 23 kB | yes |
 
 The fp32 encoders are over GitHub's 100 MB limit and are only the parity reference. The
 1024 and 512 encoders share every weight; only the static shapes differ (the Hiera
 position embedding is resized to the token grid inside the graph and folded by
-onnxruntime at session creation). Shipped set per resolution: 32.5 + 9.0 = 41.5 MB (512)
-or 32.5 + 10.6 = 43.1 MB (1024).
+onnxruntime at session creation). Shipped image set per resolution: 32.5 + 9.0 = 41.5 MB
+(512) or 32.5 + 10.6 = 43.1 MB (1024). The video mode adds the fp16 memory graphs and the
+pointer graphs: 2.9 + 12.0 + 0.9 = 15.8 MB at 512 (57.3 MB in total) or
+3.3 + 12.1 + 0.9 = 16.3 MB at 1024 (59.4 MB in total). Every file is under 100 MB except
+the two fp32 reference encoders.
 
 ## `image_encoder_{S}`
 
@@ -97,7 +115,160 @@ Output selection is left to the caller (token 0 = single mask, tokens 1..3 = mul
    original size, threshold at 0. During tracking, a frame with
    `object_score_logits <= 0` counts as "object absent".
 
-## Parity (tiny, ORT 1.31 CPU provider vs torch fp32)
+## Video graphs
+
+Exported by the same command (`--graphs memory` for these only). All fp32 I/O, batch 1,
+one object per run. `fp16` variants: fp16 weights and compute, fp32 inputs and outputs.
+
+### `memory_encoder_{S}`
+
+| Name | Dir | dtype | Shape | Meaning |
+|------|-----|-------|-------|---------|
+| `vision_feat` | in | float32 | `[1, 256, S/16, S/16]` | raw stride-16 level: encoder `image_embed - no_mem_embed` |
+| `mask_logits` | in | float32 | `[1, 1, S, S]` | high-res logits of the chosen mask (bilinear upsample of the S/4 logits) |
+| `object_score_logits` | in | float32 | `[1, 1]` | the head's score for this frame |
+| `binarize` | in | float32 | `[1]` | 1 for a clicked (conditioning) frame, 0 for a tracked frame |
+| `maskmem_features` | out | float32 | `[1, 64, S/16, S/16]` | memory features (store rounded to bfloat16, see below) |
+| `maskmem_pos_enc` | out | float32 | `[1, 64, S/16, S/16]` | sine position encoding; a constant of S, cache it from the first call |
+
+Inside the graph: `m = binarize ? (mask_logits > 0) : sigmoid(mask_logits)`, then
+`20 * m - 10`, the memory encoder, and `+ no_obj_embed_spatial` when
+`object_score_logits <= 0`.
+
+### `memory_attention_{S}`
+
+| Name | Dir | dtype | Shape | Meaning |
+|------|-----|-------|-------|---------|
+| `curr` | in | float32 | `[1, HW, 256]` | raw stride-16 tokens, `HW = (S/16)^2`, row-major over the grid (transpose of `vision_feat`) |
+| `memory` | in | float32 | `[1, N, 64]` | spatial memories (whole frames of HW tokens) then pointer tokens; N dynamic |
+| `memory_pos` | in | float32 | `[1, N, 64]` | their position encodings |
+| `num_obj_ptr_tokens` | in | int64 | `[1]` | pointer tokens at the end of `memory` (4 per pointer); excluded from RoPE |
+| `fused` | out | float32 | `[1, HW, 256]` | memory-conditioned tokens |
+| `image_embed` | out | float32 | `[1, 256, S/16, S/16]` | the same values as a map: the SAM head's `image_embed` for a tracked frame |
+
+`image_embed` is `fused` **transposed** (`[HW, 256] -> [256, HW]`), not reshaped; feed it
+to the head directly and ignore `fused`. The stride-16 position encoding (`curr_pos`) is a
+constant of S and is built inside the graph, as are the RoPE tables (real arithmetic:
+each channel pair `(x0, x1)` becomes `(x0 cos - x1 sin, x0 sin + x1 cos)`; the keys before
+the pointer tokens are rotated frame by frame with the query grid's table, so any number
+of memory frames works). The attention is split into static query chunks so that one
+score matrix stays under 64 MiB for a full bank (7 frames + 16 pointers): 8 chunks of 512
+queries at 1024, one chunk at 512. Every extra clicked frame adds HW keys (all
+conditioning frames are attended, `max_cond_frames_in_attn = -1`).
+
+### `object_pointer` and `object_pointer_tpos`
+
+Identical at every S, so one file each (not `_{S}`).
+
+| Graph | Name | Dir | dtype | Shape | Meaning |
+|-------|------|-----|-------|-------|---------|
+| `object_pointer` | `mask_token` | in | float32 | `[1, 256]` | `sam_tokens[i]` of the chosen output (selection rule 3 above) |
+| | `object_score_logits` | in | float32 | `[1, 1]` | the head's score |
+| | `obj_ptr` | out | float32 | `[1, 256]` | `obj_ptr_proj(token)` if score > 0, else the learned `no_obj_ptr` |
+| `object_pointer_tpos` | `t_diff` | in | float32 | `[K]` | temporal distance of each pointer (integers as float, K dynamic) |
+| | `t_diff_max` | in | float32 | `[1]` | `min(num_frames, 16) - 1` |
+| | `ptr_pos` | out | float32 | `[K, 64]` | `obj_ptr_tpos_proj(sine_256(t_diff / t_diff_max))` |
+
+### `constants_{S}.json`
+
+Everything the loop needs outside the graphs; the demo never reads the checkpoint. Floats
+are written exactly (float32 values printed as float64), so `Float32Array.from` restores
+them bit for bit.
+
+| Key | Value | Use |
+|-----|-------|-----|
+| `pixel_mean`, `pixel_std` | `(0.485, 0.456, 0.406)`, `(0.229, 0.224, 0.225)` | frame normalisation |
+| `no_mem_embed` | `[256]` | `vision_feat = image_embed - no_mem_embed` (per channel) |
+| `maskmem_tpos_enc` | `[7][64]` | temporal slot encodings of spatial memories |
+| `no_obj_ptr`, `no_obj_embed_spatial` | `[256]`, `[64]` | baked into the graphs; listed for auditing |
+| `no_obj_score` | -1024 | mask logits of a frame where the object is absent |
+| `stability_delta`, `stability_thresh` | 0.05, 0.98 | single-mask stability rule |
+| `multimask_min_pt_num`, `multimask_max_pt_num` | 0, 1 | multimask when the prompt has 0 or 1 points |
+| `mask_input_clamp` | 32 | clamp of a previous mask fed back as `mask_input` |
+| `num_maskmem`, `max_obj_ptrs_in_encoder`, `tokens_per_obj_ptr` | 7, 16, 4 | memory bank sizes |
+| `memory_temporal_stride_for_eval`, `max_cond_frames_in_attn`, `only_obj_ptrs_in_the_past_for_eval` | 1, -1, true | bank selection (released settings) |
+| `sigmoid_scale_for_mem_enc`, `sigmoid_bias_for_mem_enc` | 20, -10 | baked into the memory encoder |
+| `image_size`, `embed_grid`, `mask_size` | S, S/16, S/4 | shapes |
+
+## Video loop recipe
+
+`tools/ort_video_loop.py` (`OrtVideoTracker`) runs this with `numpy` + `onnxruntime`
+only; the TypeScript port follows it step by step. Notation: `g = S/16`, `HW = g*g`,
+`m = S/4`; `d = +1` forward, `-1` reverse; frames are 0-based.
+
+**Per video**
+
+1. Load `constants_{S}.json` and the six sessions.
+2. Each frame: RGB, resize to S x S ignoring aspect ratio (PIL bicubic in Python; see
+   deviations), `x / 255`, `(x - pixel_mean) / pixel_std`, CHW float32.
+
+**Per frame (once, cached)**
+
+3. `image_encoder` -> `image_embed`, `high_res_feat_s0`, `high_res_feat_s1`.
+   `vision_feat = image_embed - no_mem_embed[c]`; `curr[t, c] = vision_feat[c, t]`
+   (`[1, HW, 256]`).
+
+**Click on frame `f`** (points in video pixels -> `x * S / W`, `y * S / H`, labels 1/0)
+
+4. `mask_input` = the frame's previous low-res logits clamped to `[-32, 32]` if it already
+   has a prediction (`has_mask_input = 1`), else zeros (`has_mask_input = 0`).
+5. Embedding: if `f` has never been tracked, the encoder's `image_embed` (no memory).
+   Otherwise steps 9-10 in the direction it was last tracked (a correction).
+6. `sam_head` with the points (padding is added in the graph). Selection:
+   multimask when the point count (a box counts 2) is 0 or 1: `best = 1 + argmax(iou[1..3])`
+   (first maximum), mask `masks[best]`, token `sam_tokens[best]`; otherwise token 0's mask
+   if `count(logit > 0.05) / count(logit > -0.05) >= 0.98` (float32; 1.0 when the
+   denominator is 0), else `masks[best]`, and the token is always `sam_tokens[0]`. If
+   `object_score_logits <= 0` the whole mask becomes -1024.
+7. `object_pointer(token, score)` -> `obj_ptr`. Keep `{pred_masks [1,1,m,m], obj_ptr,
+   score}` as *pending* (no memory yet; further clicks redo 4-7).
+
+**Start of propagation**
+
+8. Each pending frame (ascending): `high_res = upsample(pred_masks, S)` (bilinear,
+   half-pixel centres, edge clamp: source coordinate `(i + 0.5) / 4 - 0.5`, clamped at 0);
+   `memory_encoder(vision_feat, high_res, score, binarize = 1)`; store
+   `bf16(maskmem_features)` (round to nearest even on the top 16 bits:
+   `u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000`); cache `maskmem_pos_enc` once as
+   tokens `pos[t, c]` (`[HW, 64]`). The frame becomes a *conditioning* frame (removed from
+   the tracked set if it was there).
+
+**Track frame `t`** (visit `start, start + d, ...` to the clip end; a conditioning frame
+is yielded with its stored prediction and not re-tracked)
+
+9. Memory bank, in this order:
+   * every conditioning frame (in the order they became conditioning): tokens
+     `feat[t, c]` (`[HW, 64]`, transpose of the stored features), pos
+     `pos + maskmem_tpos_enc[6]`;
+   * for `t_pos = 1 .. 6`: frame `p = t - d * (7 - t_pos)`; if `p` is a *tracked* frame
+     with memory (conditioning frames never fill these slots): tokens of `p`, pos
+     `pos + maskmem_tpos_enc[6 - t_pos]` (`t_pos = 6` is the previous frame, row 0);
+   * pointers, with `P = min(num_frames, 16)`: every conditioning frame `c` with
+     `c <= t` (forward) / `c >= t` (reverse) at distance `(t - c) * d`, then for
+     `k = 1 .. P - 1` the tracked frame `t - d * k` at distance `k` (stop at the first
+     index outside the clip; skip frames that are not tracked). `ptr_pos =
+     object_pointer_tpos(distances, [P - 1])`; pointer `j` contributes 4 tokens
+     `obj_ptr[64 i : 64 (i + 1)]`, `i = 0..3`, each with position `ptr_pos[j]`.
+   * `memory = concat(...)` `[1, N, 64]`, `memory_pos` likewise,
+     `num_obj_ptr_tokens = 4 * #pointers`.
+10. `memory_attention(curr, memory, memory_pos, num_obj_ptr_tokens)` -> `image_embed`.
+11. `sam_head(image_embed, s0, s1, point (0, 0) label -1, zeros, has_mask_input = 0)`;
+    selection as step 6 with 0 points (multimask); -1024 mask when the score is <= 0;
+    `object_pointer`.
+12. `memory_encoder(vision_feat, upsample(pred_masks, S), score, binarize = 0)`, store
+    `bf16(features)`; frame `t` is now tracked (with its direction).
+13. Display: bilinear upsample of `pred_masks` to the video size, threshold 0; the object
+    is occluded when `score <= 0`.
+
+**Deviations from `video_predictor.py`**: one object (the demo's scope; the torch side
+batches objects independently anyway); no mask prompt (`add_mask`) and no box in
+`add_click` (the head accepts a box as labels 2 and 3, so adding it is mechanical);
+`clear_old_points` is always true. Everything else, including corrections on tracked
+frames and the general frame-selection rules (`max_cond_frames_in_attn`, temporal
+stride), mirrors the torch code. In the browser, canvas resizing is not PIL bicubic;
+that changes the encoder input slightly and is outside this parity check.
+
+## Parity: image half (tiny, ORT 1.31 CPU provider vs torch fp32)
 
 Three images x their manifest prompts, each decoded with and without a mask prompt (18
 cases per row). `max|err|` is over every output of that graph (head rows get torch's
@@ -123,6 +294,96 @@ The int8 and fp16 files save download size, not CPU time. With default session o
 ORT dequantizes the int8 weights on every run (the int8 rows above); with
 `session.disable_quant_qdq = "1"` it folds them once at load and the 512 int8 encoder
 runs in about 110 ms, bit-identical outputs. The fp16 head is slower than fp32 on CPU.
+
+## Parity: video half (tiny, ORT 1.31 CPU provider)
+
+Bedroom clip (48 frames, 960 x 540), one positive click at (210, 350): on frame 0
+propagated forward (48 frames) and on frame 30 propagated in reverse (31 frames), the
+prompts of `tools/dump_reference.py`. Reference: the official package's dump at 1024;
+at 512, where no dump exists, this repo's torch `VideoPredictor` built with
+`dataclasses.replace(TINY, image_size=512)` (it matches the official package exactly at
+1024). Graph rows replay the memory calls of frames 1, 2, 7, 20 and 47 (the memory
+encoder rows add three synthetic calls for the branches the clip never takes: a clicked
+mask and an absent object). The object is visible on every frame of this clip (lowest
+object score 5.9), so no occlusion is exercised end to end. `max|err|` for the memory
+encoder is before the bfloat16 storage rounding; memory-attention IoU is the tracking
+head call (fp32 head) on the graph's embedding vs on the reference embedding; loop IoU is
+per frame on the S/4 logits at 0. Graph `ms` is one call with the frame-47 bank (7
+spatial frames + 16 pointers); loop `ms` is the median per tracked frame including the
+encoder.
+
+| Graph / loop | S | Precision | MB | max\|err\| | IoU min (frame) | IoU mean | ORT CPU ms | Criterion |
+|--------------|--:|-----------|---:|-----------:|----------------:|---------:|-----------:|-----------|
+| `memory_encoder_1024` | 1024 | fp32 | 6.6 | 3.8e-05 | | | 40 | < 1e-3: pass |
+| `memory_encoder_1024` | 1024 | fp16 | 3.3 | 2.3e-03 | | | 50 | reported |
+| `memory_attention_1024` | 1024 | fp32 | 24.0 | 7.7e-05 | 1.0000 | 1.0000 | 1005 | < 1e-3, >= 0.999: pass |
+| `memory_attention_1024` | 1024 | fp16 | 12.1 | 5.5e-03 | 1.0000 | 1.0000 | 4375 | >= 0.99: pass |
+| loop forward | 1024 | fp32 | 161.7 | | 1.0000 | 1.0000 | 2125 | >= 0.999: pass |
+| loop reverse | 1024 | fp32 | 161.7 | | 1.0000 | 1.0000 | 1881 | >= 0.999: pass |
+| loop forward | 1024 | shipped | 59.3 | | 0.9620 (44) | 0.9959 | 4029 | >= 0.98: **fail** |
+| loop reverse | 1024 | shipped | 59.3 | | 0.7916 (7) | 0.9756 | 3891 | >= 0.98: **fail** |
+| `memory_encoder_512` | 512 | fp32 | 5.9 | 5.4e-05 | | | 8 | < 1e-3: pass |
+| `memory_encoder_512` | 512 | fp16 | 2.9 | 2.2e-03 | | | 11 | reported |
+| `memory_attention_512` | 512 | fp32 | 23.9 | 1.2e-05 | 1.0000 | 1.0000 | 69 | < 1e-3, >= 0.999: pass |
+| `memory_attention_512` | 512 | fp16 | 12.0 | 5.7e-03 | 1.0000 | 1.0000 | 140 | >= 0.99: pass |
+| loop forward | 512 | fp32 | 157.6 | | 1.0000 | 1.0000 | 220 | >= 0.999: pass |
+| loop reverse | 512 | fp32 | 157.6 | | 1.0000 | 1.0000 | 222 | >= 0.999: pass |
+| loop forward | 512 | shipped | 57.3 | | 0.9701 (43) | 0.9903 | 308 | >= 0.97: pass |
+| loop reverse | 512 | shipped | 57.3 | | 0.9886 (22) | 0.9968 | 326 | >= 0.97: pass |
+| `object_pointer` | any | fp32 | 0.8 | 7.2e-07 | | | < 0.1 | < 1e-3: pass |
+| `object_pointer_tpos` | any | fp32 | 0.07 | 1.4e-06 | | | < 0.1 | < 1e-3: pass |
+
+Shipped set: int8 encoder, fp16 head, fp16 memory encoder, fp16 memory attention, fp32
+pointer graphs (MB column: the files the loop loads). The fp32 loop's largest per-frame
+errors are 0.010 (1024) / 0.021 (512) in low-res logits, 5e-4 / 8e-4 in the object score
+and 1e-3 / 2e-3 in the object pointer.
+
+Per-graph CPU time inside the loop (median over the clip, ms; Apple M5, default threads):
+
+| S | Set | encoder | memory attention | SAM head | memory encoder | pointer graphs | tracked frame |
+|--:|-----|--------:|-----------------:|---------:|---------------:|---------------:|--------------:|
+| 1024 | fp32 | 830 | 1222 | 21 | 42 | 0.2 | 2125 |
+| 1024 | shipped | 687 | 3266 | 26 | 46 | 0.2 | 4029 |
+| 512 | fp32 | 132 | 70 | 4.7 | 10 | 0.1 | 220 |
+| 512 | shipped | 134 | 151 | 8.3 | 12 | 0.1 | 308 |
+
+fp16 is slower than fp32 on the CPU provider (as for the head); the fp16 files exist for
+download size and for WebGPU with `shader-f16`. The fp32 memory graphs are the fallback,
+like the fp32 head.
+
+### Precision study (loop IoU min, forward / reverse)
+
+| Image encoder | SAM head | Memory graphs | 512 | 1024 |
+|---------------|----------|---------------|----:|-----:|
+| fp32 | fp32 | fp32 | 1.0000 / 1.0000 | 1.0000 / 1.0000 |
+| fp32 | fp32 | fp32, memory kept fp32 (no bfloat16 rounding) | 1.0000 / 0.9978 | 0.9952 / 0.9965 |
+| fp32 | fp32 | fp16 encoder, fp32 attention | 1.0000 / 1.0000 | |
+| fp32 | fp32 | fp32 encoder, fp16 attention | 1.0000 / 1.0000 | |
+| fp32 | fp32 | fp16 | 0.9853 / 1.0000 | 1.0000 / 0.9981 |
+| fp32 | fp16 | fp32 | 0.9589 / 0.9824 | 0.9955 / 0.8020 |
+| int8 | fp32 | fp32 | 0.9701 / 0.9887 | 0.9620 / 0.8012 |
+| int8 | fp16 | fp32 | 0.9701 / 0.9886 | 0.9578 / 0.7916 |
+| int8 | fp16 | fp16 encoder, fp32 attention | 0.9701 / 0.9886 | |
+| **int8** | **fp16** | **fp16 (shipped)** | **0.9701 / 0.9886** | **0.9620 / 0.7916** |
+| fp16 (54.6 MB, not exported) | fp16 | fp16 | 0.9831 / 0.9538 | 0.9955 / 0.9660 |
+
+* The memory graphs are not the problem: in fp16 alone they keep min IoU >= 0.985 at
+  512 and >= 0.998 at 1024, so they ship in fp16.
+* The bfloat16 rounding of stored memory features is part of the reference behaviour:
+  skipping it moves masks (0.9952 at 1024), so the loop keeps it (a two-line integer
+  operation, step 8).
+* The loss comes from the image side. At 512 the tracked face covers about 70 pixels of
+  the 128 x 128 mask grid, so one boundary pixel is about 1.5 % IoU; the weak frames are
+  spread over the clip (frame 1 is already 0.971 with the int8 encoder) rather than
+  drifting.
+* The 1024 reverse failure is a multimask near-tie, not a numerical fault. On reverse
+  frames 6 to 16 the reference's predicted IoUs for tokens 1 and 3 are within 0.002 to
+  0.01 of each other (frame 7: 0.7916 vs 0.7898) and the two candidates overlap at IoU
+  0.80. Any image-side perturbation (fp16 head alone, int8 encoder alone, an fp16
+  encoder) picks the other candidate on some of those frames; the run recovers within a
+  few frames (mean 0.976). The fp32 head does not help with the int8 encoder, and no
+  shippable encoder precision passes 0.98 there. The demo's video default is 512 (D5),
+  where the shipped set passes.
 
 ## int8 encoder: what was tried
 
@@ -173,3 +434,19 @@ compute.
   `session.disable_quant_qdq = "1"` folds them once at load (fp32 weights resident, same
   speed as the fp32 graph, identical outputs); in ORT Web pass it through
   `extra.session.disable_quant_qdq`.
+* Video graph ops: memory encoder Add, Cast, Conv, Div, Erf, Greater, MatMul, Mul, Pow,
+  ReduceMean, Reshape, Sigmoid, Sqrt, Sub, Transpose, Where; memory attention Add,
+  Concat, Expand, Gather, LayerNormalization, MatMul, Mul, Relu, Reshape, Shape, Slice,
+  Softmax, Sub, Transpose, Unsqueeze; pointer graphs Add, Concat, Cos, Div, Gemm,
+  Greater, Mul, Relu, Sin, Sub, Unsqueeze, Where (fp16 files add Cast and Identity). None
+  is in the avoid list (checked by the export test). The memory attention's only dynamic
+  dimension is the bank length N (Shape / Slice / Reshape on it); its RoPE and position
+  grids are Expand / Concat of small constant tables, folded at session creation.
+* Memory attention buffers: with a full bank the fp32 score matrix per query chunk is
+  512 x 28 736 (59 MB, 8 chunks) at 1024 and 1024 x 7 232 (30 MB, one chunk) at 512; the
+  self attention at 1024 is 4096 x 4096 (64 MiB). Each extra clicked frame adds HW keys.
+  The bank itself is rebuilt by the caller every frame: up to 7.4 MB at 1024 and 1.9 MB
+  at 512.
+* fp16 memory graphs, like the fp16 heads, need `shader-f16`; otherwise load the fp32
+  files.
+

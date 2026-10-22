@@ -1,0 +1,51 @@
+{
+  "clips": [
+    {
+      "id": "blackswan",
+      "frames": 48,
+      "width": 640,
+      "height": 360,
+      "bytes": 2435625,
+      "source": "DAVIS 2017 (CC BY-NC 4.0)"
+    },
+    {
+      "id": "bmx-trees",
+      "frames": 48,
+      "width": 640,
+      "height": 360,
+      "bytes": 2074955,
+      "source": "DAVIS 2017 (CC BY-NC 4.0)"
+    },
+    {
+      "id": "libby",
+      "frames": 48,
+      "width": 640,
+      "height": 360,
+      "bytes": 1985088,
+      "source": "DAVIS 2017 (CC BY-NC 4.0)"
+    }
+  ],
+  "images": [
+    {
+      "id": "truck",
+      "width": 1280,
+      "height": 853,
+      "bytes": 211349,
+      "source": "facebookresearch/sam2 notebook images (Apache-2.0)"
+    },
+    {
+      "id": "cars",
+      "width": 1280,
+      "height": 853,
+      "bytes": 189678,
+      "source": "facebookresearch/sam2 notebook images (Apache-2.0)"
+    },
+    {
+      "id": "groceries",
+      "width": 800,
+      "height": 534,
+      "bytes": 105990,
+      "source": "facebookresearch/sam2 notebook images (Apache-2.0)"
+    }
+  ]
+}
