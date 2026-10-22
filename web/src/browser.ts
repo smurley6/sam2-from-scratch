@@ -51,13 +51,17 @@ export function configureOrt(ort: OrtModule & OrtEnv, version: string): void {
   setOrt(ort);
 }
 
-/** A `LoadBytes` that fetches `${baseUrl}/${file}` with download progress. */
-export function fetchLoader(baseUrl: string): LoadBytes {
+/**
+ * A `LoadBytes` that fetches `${baseUrl}/${file}` with download progress. Progress is
+ * measured against `sizes[file]` when given (exact, and works when the server sends no
+ * content-length or a compressed one), else against the content-length header.
+ */
+export function fetchLoader(baseUrl: string, sizes?: Readonly<Record<string, number>>): LoadBytes {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   return async (file, onProgress) => {
     const res = await fetch(base + file);
     if (!res.ok || res.body === null) throw new Error(`Could not download ${file} (${res.status})`);
-    const total = Number(res.headers.get("content-length")) || 0;
+    const total = sizes?.[file] ?? (Number(res.headers.get("content-length")) || 0);
     const reader = res.body.getReader();
     const chunks: Uint8Array[] = [];
     let got = 0;
