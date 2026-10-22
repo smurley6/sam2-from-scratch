@@ -98,6 +98,18 @@ the browser (one object per demo run); mobile-phone performance targets.
 
 ## Change log
 
+- 2026-10-22: T2, T3, T4 landed with exact (0.0) parity against the official package on
+  tiny and small: image encoder, SAM heads and image predictor, memory encoder, memory
+  attention, assembled model (every checkpoint key consumed) and video predictor (bedroom
+  clip forward and reverse, min IoU 1.0). Two reference details not in the YAML: the video
+  predictor binarises prompted-frame masks before memory encoding, and memory features are
+  stored in bfloat16. T6a landed: ONNX graphs for the image half at 1024 and 512 (int8
+  weight-only encoder 32.5 MB using plain DequantizeLinear ops because ORT Web's WebGPU
+  provider has no MatMulInteger kernel; fp16 heads ~10 MB; see exports/README.md). The
+  mask grid at 512 is 128x128, not 256x256. DAVIS 2017 val downloaded (the ETH cvlvision
+  URL is dead; the csergi mirror works) and the official evaluator installed;
+  tools/eval_davis.py drives it.
+
 - 2026-10-21: program created. Decisions D1 to D8 locked. Venv on Python 3.12 with torch
   (MPS), reference `sam2` package installed test-only, SAM 2.1 tiny and small checkpoints
   downloaded and hashed (`checkpoints/SHA256SUMS`).
