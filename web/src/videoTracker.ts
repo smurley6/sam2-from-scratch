@@ -29,13 +29,25 @@ export interface TrackedFrame {
   /** Object score logit; the object is occluded / absent when <= 0. */
   readonly score: number;
   readonly isConditioning: boolean;
+  /** Wall-clock ms this frame's tracking took, excluding the image encoder (0 if stored). */
+  readonly ms: number;
 }
 
-export interface VideoTrackerOptions {
+export interface FrameEncoderOptions {
   /** Keep every frame's encoder outputs (about 6 MB per frame at 512). Default false. */
   readonly cacheAll?: boolean;
+  /** Where `image_encoder` timings go (default: the encoder's own `timings`). */
+  readonly timings?: Timings;
+}
+
+export interface VideoTrackerOptions extends FrameEncoderOptions {
   /** Round stored memory features to bfloat16 as the reference does. Default true. */
   readonly bf16Memory?: boolean;
+  /**
+   * A per-frame encoder cache shared with other trackers of the same clip (one encoder
+   * pass per frame for every object; see `MultiObjectTracker`). Default: a private one.
+   */
+  readonly encoder?: FrameEncoder;
 }
 
 export interface VideoSize {
@@ -45,6 +57,50 @@ export interface VideoSize {
 
 /** Python `//` for integers. */
 const floorDiv = (a: number, b: number): number => Math.floor(a / b);
+
+/**
+ * The image encoder over a clip, run once per frame: a one-frame cache (the frame being
+ * clicked or tracked), plus every frame when `cacheAll` is set. The encoder output does
+ * not depend on the object, so several trackers can share one of these.
+ */
+export class FrameEncoder {
+  readonly timings: Timings;
+  readonly numFrames: number;
+  readonly size: number;
+  #last: { frame: number; feats: FrameFeatures } | null = null;
+  readonly #cache: Map<number, FrameFeatures> | null;
+
+  constructor(
+    private readonly sessions: Pick<SessionSet, "imageEncoder">,
+    private readonly consts: Constants,
+    readonly frames: FrameSource,
+    opts: FrameEncoderOptions = {},
+  ) {
+    this.numFrames = frames.count;
+    this.size = consts.image_size;
+    this.timings = opts.timings ?? {};
+    this.#cache = opts.cacheAll === true ? new Map() : null;
+  }
+
+  async features(frame: number): Promise<FrameFeatures> {
+    const cached = this.#cache?.get(frame);
+    if (cached !== undefined) return cached;
+    if (this.#last !== null && this.#last.frame === frame) return this.#last.feats;
+    if (!(frame >= 0 && frame < this.numFrames)) throw new Error(`frame ${frame} out of range`);
+    const input = await this.frames.get(frame);
+    const enc = await encodeImage(this.sessions, input, this.size, this.timings);
+    const feats = withMemoryTokens(enc, this.consts);
+    this.#last = { frame, feats };
+    this.#cache?.set(frame, feats);
+    return feats;
+  }
+
+  /** Drop the cached features. */
+  clear(): void {
+    this.#last = null;
+    this.#cache?.clear();
+  }
+}
 
 /**
  * One object tracked through one video with the exported graphs: a port of
@@ -68,39 +124,33 @@ export class VideoTracker {
   /** frame -> reverse flag of its last tracking. */
   readonly #tracked = new Map<number, boolean>();
   #maskmemPos: Float32Array | null = null; // [HW, 64] tokens, cached once
-  #last: { frame: number; feats: FrameFeatures } | null = null;
-  readonly #cache: Map<number, FrameFeatures> | null;
+  readonly #encoder: FrameEncoder;
   readonly #bf16: boolean;
   #busy = false;
 
   constructor(
     private readonly sessions: SessionSet,
     private readonly consts: Constants,
-    private readonly frames: FrameSource,
+    frames: FrameSource,
     private readonly videoSize: VideoSize,
     opts: VideoTrackerOptions = {},
   ) {
     this.numFrames = frames.count;
     this.size = consts.image_size;
     this.grid = consts.embed_grid;
-    this.#cache = opts.cacheAll === true ? new Map() : null;
+    if (opts.encoder !== undefined && opts.encoder.numFrames !== frames.count) {
+      throw new Error("VideoTracker: the shared encoder belongs to a clip of another length");
+    }
+    this.#encoder =
+      opts.encoder ?? new FrameEncoder(sessions, consts, frames, { cacheAll: opts.cacheAll, timings: this.timings });
     this.#bf16 = opts.bf16Memory ?? true;
   }
 
   // ------------------------------------------------------------------ step 1: encode
 
   /** Encode once per frame (one-frame cache, plus the full cache when enabled). */
-  async features(frame: number): Promise<FrameFeatures> {
-    const cached = this.#cache?.get(frame);
-    if (cached !== undefined) return cached;
-    if (this.#last !== null && this.#last.frame === frame) return this.#last.feats;
-    if (!(frame >= 0 && frame < this.numFrames)) throw new Error(`frame ${frame} out of range`);
-    const input = await this.frames.get(frame);
-    const enc = await encodeImage(this.sessions, input, this.size, this.timings);
-    const feats = withMemoryTokens(enc, this.consts);
-    this.#last = { frame, feats };
-    this.#cache?.set(frame, feats);
-    return feats;
+  features(frame: number): Promise<FrameFeatures> {
+    return this.#encoder.features(frame);
   }
 
   // ------------------------------------------------------------------ step 2: SAM head
@@ -356,6 +406,7 @@ export class VideoTracker {
       for (let frame = first; reverse ? frame >= 0 : frame < this.numFrames; frame += step) {
         let out = this.#cond.get(frame);
         const isConditioning = out !== undefined;
+        let took = 0;
         if (out === undefined) {
           const feats = await this.features(frame);
           const t0 = performance.now();
@@ -363,10 +414,11 @@ export class VideoTracker {
           out = await this.samHead(embed, feats, [0, 0], [LABEL_PAD], null);
           await this.encodeMemory(frame, out, false);
           this.#nonCond.set(frame, out);
-          this.frameTimes.push(performance.now() - t0);
+          took = performance.now() - t0;
+          this.frameTimes.push(took);
         }
         this.#tracked.set(frame, reverse);
-        yield { frame, lowRes: out.predMasks, score: out.score, isConditioning };
+        yield { frame, lowRes: out.predMasks, score: out.score, isConditioning, ms: took };
       }
     } finally {
       this.#busy = false;
@@ -379,7 +431,26 @@ export class VideoTracker {
     const cond = this.#cond.get(frame);
     const out = pending ?? cond ?? this.#nonCond.get(frame);
     if (out === undefined) return null;
-    return { frame, lowRes: out.predMasks, score: out.score, isConditioning: pending !== undefined || cond !== undefined };
+    return {
+      frame,
+      lowRes: out.predMasks,
+      score: out.score,
+      isConditioning: pending !== undefined || cond !== undefined,
+      ms: 0,
+    };
+  }
+
+  /** Frames with clicks (conditioning frames plus clicks not yet propagated), ascending. */
+  get promptedFrames(): number[] {
+    return [...new Set([...this.#cond.keys(), ...this.#pending.keys()])].sort((a, b) => a - b);
+  }
+
+  get hasPrompts(): boolean {
+    return this.#cond.size > 0 || this.#pending.size > 0;
+  }
+
+  get busy(): boolean {
+    return this.#busy;
   }
 
   /** Forget every click and memory (keeps the encoder cache). */

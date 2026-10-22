@@ -8,24 +8,31 @@ Writes ``exports/browser_reference/``::
     clip_blackswan/frames_u8.bin      [T, 512, 512, 3] uint8, PIL-bicubic resized frames
     clip_blackswan/masks.bin          [T, 128, 128] float32 low-res logits, forward run
     clip_blackswan/meta.json          click, scores, obj_ptr norms, shapes
+    clip_bmx-trees/frames_u8.bin      [T, 512, 512, 3] uint8
+    clip_bmx-trees/masks.bin          [2, T, 128, 128] two objects (rider, bike) tracked
+                                      independently, sharing one encoder pass per frame
+    clip_bmx-trees/nonoverlap.bin     [2, T, 128, 128] the same after `non_overlapping`
+    clip_bmx-trees/meta.json          clicks per object, scores, shapes
     image_truck/image_u8.bin          [512, 512, 3] uint8
     image_truck/prompts.json          prompts and head outputs (masks in masks.bin)
 
-Usage: ``PYTHONPATH=src python tools/dump_browser_reference.py``
+Usage: ``PYTHONPATH=src python tools/dump_browser_reference.py [--only bmx-trees]``
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
-from ort_video_loop import Constants, Graphs, OrtVideoTracker, run  # noqa: E402
+from ort_video_loop import Constants, Features, Graphs, OrtVideoTracker, run  # noqa: E402
 
 SIZE = 512
 PRECISIONS = {
@@ -35,8 +42,14 @@ PRECISIONS = {
     "memory_attention": "fp32",
 }
 OUT = ROOT / "exports" / "browser_reference"
-CLIP = ROOT / "bundle" / "clips" / "blackswan"
-CLICK = {"frame": 0, "points": [[330, 190]], "labels": [1]}  # on the swan, 640x360 pixels
+CLIPS = ROOT / "bundle" / "clips"
+# Clicks in 640x360 video pixels: blackswan, one object; bmx-trees, the rider (shirt and
+# shorts) and the bike (both wheels), two independent memory banks over one encoder pass.
+CLICK = {"frame": 0, "points": [[330, 190]], "labels": [1]}  # on the swan
+BMX_CLICKS = [
+    {"frame": 0, "points": [[340, 150], [335, 185]], "labels": [1, 1]},
+    {"frame": 0, "points": [[290, 235], [395, 235]], "labels": [1, 1]},
+]
 IMAGE = ROOT / "bundle" / "images" / "truck.jpg"
 IMAGE_PROMPTS = [
     {"name": "one_point", "points": [[356, 267]], "labels": [1]},
@@ -54,13 +67,18 @@ def normalise(u8: np.ndarray, consts: Constants) -> np.ndarray:
     return np.ascontiguousarray(x.transpose(2, 0, 1)).astype(np.float32)
 
 
-def dump_clip(graphs: Graphs, consts: Constants) -> None:
-    out = OUT / "clip_blackswan"
-    out.mkdir(parents=True, exist_ok=True)
-    files = sorted(CLIP.glob("*.jpg"))
+def load_clip(name: str, consts: Constants) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    files = sorted((CLIPS / name).glob("*.jpg"))
     u8 = np.stack([resize_u8(Image.open(f)) for f in files])
     w, h = Image.open(files[0]).size
     frames = np.stack([normalise(f, consts) for f in u8])
+    return u8, frames, (h, w)
+
+
+def dump_clip(graphs: Graphs, consts: Constants) -> None:
+    out = OUT / "clip_blackswan"
+    out.mkdir(parents=True, exist_ok=True)
+    u8, frames, (h, w) = load_clip("blackswan", consts)
     tracker = OrtVideoTracker(graphs, consts, frames, (h, w))
     tracker.add_click(CLICK["frame"], CLICK["points"], CLICK["labels"])
     masks, scores, ptr_norm = [], [], []
@@ -75,7 +93,7 @@ def dump_clip(graphs: Graphs, consts: Constants) -> None:
     meta = {
         "size": SIZE,
         "video_hw": [h, w],
-        "num_frames": len(files),
+        "num_frames": len(frames),
         "click": CLICK,
         "frames_u8_shape": list(u8.shape),
         "masks_shape": list(masks_arr.shape),
@@ -85,7 +103,68 @@ def dump_clip(graphs: Graphs, consts: Constants) -> None:
         "precisions": PRECISIONS,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"clip: frames {len(files)} area frame0 {area[0]:.3f} min {min(area):.3f}")
+    print(f"clip: frames {len(frames)} area frame0 {area[0]:.3f} min {min(area):.3f}")
+
+
+def dump_multi_clip(graphs: Graphs, consts: Constants) -> None:
+    """Two objects on bmx-trees: one ``OrtVideoTracker`` (memory bank) per object, both
+    reading the same encoder cache, so every frame is encoded once. ``nonoverlap.bin`` is
+    the torch ``non_overlapping`` of the two runs, the display rule the browser mirrors."""
+    from sam2_scratch.video_predictor import non_overlapping  # torch: display rule only
+
+    out = OUT / "clip_bmx-trees"
+    out.mkdir(parents=True, exist_ok=True)
+    u8, frames, (h, w) = load_clip("bmx-trees", consts)
+    cache: dict[int, Features] = {}
+    masks, scores = [], []
+    for click in BMX_CLICKS:
+        tracker = OrtVideoTracker(graphs, consts, frames, (h, w), encoder_cache=cache)
+        tracker.add_click(click["frame"], click["points"], click["labels"])
+        run_masks, run_scores = [], []
+        for _frame, fo in tracker.propagate():
+            run_masks.append(fo.pred_masks[0, 0])
+            run_scores.append(float(fo.object_score_logits[0, 0]))
+        masks.append(np.stack(run_masks))
+        scores.append(run_scores)
+        encodes = len(tracker.timings.per_graph.get("image_encoder", []))
+        print(f"bmx-trees object {len(masks)}: encoder calls {encodes}")
+    masks_arr = np.stack(masks).astype(np.float32)  # [K, T, m, m]
+    # non_overlapping takes one frame's [num_obj, 1, H, W]; applied per frame.
+    nonoverlap = np.stack(
+        [
+            non_overlapping(torch.from_numpy(masks_arr[:, t])[:, None])[:, 0].numpy()
+            for t in range(masks_arr.shape[1])
+        ],
+        axis=1,
+    ).astype(np.float32)
+    u8.tofile(out / "frames_u8.bin")
+    masks_arr.tofile(out / "masks.bin")
+    nonoverlap.tofile(out / "nonoverlap.bin")
+    area = [[float((m > 0).mean()) for m in obj] for obj in masks_arr]
+    overlap = [
+        float(
+            ((masks_arr[0, t] > 0) & (masks_arr[1, t] > 0)).sum()
+            / max(1, ((masks_arr[0, t] > 0) | (masks_arr[1, t] > 0)).sum())
+        )
+        for t in range(masks_arr.shape[1])
+    ]
+    meta = {
+        "size": SIZE,
+        "video_hw": [h, w],
+        "num_frames": len(frames),
+        "objects": BMX_CLICKS,
+        "frames_u8_shape": list(u8.shape),
+        "masks_shape": list(masks_arr.shape),
+        "object_score_logits": scores,
+        "mask_area_fraction": area,
+        "pairwise_iou": overlap,
+        "precisions": PRECISIONS,
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(
+        f"bmx-trees: frames {len(frames)} areas frame0 {area[0][0]:.3f} / {area[1][0]:.3f} "
+        f"min {min(area[0]):.3f} / {min(area[1]):.3f} max pairwise IoU {max(overlap):.3f}"
+    )
 
 
 def dump_image(graphs: Graphs, consts: Constants) -> None:
@@ -157,10 +236,23 @@ def dump_image(graphs: Graphs, consts: Constants) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--only",
+        choices=["blackswan", "bmx-trees", "image"],
+        action="append",
+        help="write only these outputs (default: all)",
+    )
+    args = parser.parse_args()
     graphs = Graphs.load(ROOT / "exports", SIZE, PRECISIONS)
     consts = Constants.load(ROOT / "exports" / f"constants_{SIZE}.json")
-    dump_clip(graphs, consts)
-    dump_image(graphs, consts)
+    wanted = set(args.only or ["blackswan", "bmx-trees", "image"])
+    if "blackswan" in wanted:
+        dump_clip(graphs, consts)
+    if "bmx-trees" in wanted:
+        dump_multi_clip(graphs, consts)
+    if "image" in wanted:
+        dump_image(graphs, consts)
     print("wrote", OUT)
 
 

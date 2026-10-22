@@ -93,10 +93,19 @@ the website before M5.
 
 ## Non-goals
 
-Training or fine-tuning on SA-V; the data engine; the SA-V dataset; multi-object batching in
-the browser (one object per demo run); mobile-phone performance targets.
+Training or fine-tuning on SA-V; the data engine; the SA-V dataset; batched multi-object
+inference in the browser (several objects run as independent loops sharing the encoder
+pass, not as one batch); mobile-phone performance targets.
 
 ## Change log
+
+- 2026-10-22 (multi-object): the browser runtime tracks several objects at once:
+  `web/src/multiObjectTracker.ts` (one `VideoTracker` memory bank per object over a shared
+  `FrameEncoder`, stepped frame by frame; `nonOverlapping` mirrors
+  `video_predictor.non_overlapping`). `tools/dump_browser_reference.py` adds a two-object
+  bmx-trees run (rider and bike, two `OrtVideoTracker`s over one encoder cache) and the Node
+  suite checks each object at IoU 1.0 against it, bit-exact `nonOverlapping`, and that an
+  object's masks are identical to tracking it alone. Site demo gains an object list.
 
 - 2026-10-22 (shipped): github.com/smurley6/sam2-from-scratch public; stevenmurley.com/projects/sam2
   and /demo/sam2 deployed and verified live on WebGPU. T8 done (React demo reviewed and

@@ -1,7 +1,7 @@
 # sam2-web
 
 Framework-free TypeScript runtime for the SAM 2.1 Hiera-T ONNX graphs in `../exports`:
-promptable image segmentation and single-object video tracking, running on ONNX Runtime Web
+promptable image segmentation and video tracking of one or several objects, running on ONNX Runtime Web
 (WebGPU, WebAssembly fallback). `src/` has no framework and no Node imports; only
 `src/browser.ts` touches the DOM, and only when its functions are called.
 
@@ -11,7 +11,8 @@ promptable image segmentation and single-object video tracking, running on ONNX 
 import * as ort from "onnxruntime-web";
 import {
   configureOrt, createSessions, fetchLoader, parseConstants, pickProvider,
-  normalize, resizeToSquare, ImagePredictor, VideoTracker, maskToImageData,
+  normalize, resizeToSquare, ImagePredictor, VideoTracker, MultiObjectTracker,
+  nonOverlapping, maskToImageData,
 } from "./sam2";
 
 configureOrt(ort, "1.22.0");                       // wasmPaths on jsDelivr, 1 thread, setOrt
@@ -35,6 +36,16 @@ const tracker = new VideoTracker(sessions, consts, frames, { width, height });
 await tracker.addClick(0, [{ x, y }], [1]);              // video pixels; 1 positive, 0 negative
 for await (const f of tracker.propagate()) {}            // { frame, lowRes, score, isConditioning }
 for await (const f of tracker.propagate(t, true)) {}     // reverse from frame t
+
+// Several objects: one memory bank each, one encoder pass per frame shared by all.
+const multi = new MultiObjectTracker(sessions, consts, frames, { width, height });
+const rider = multi.addObject();
+const bike = multi.addObject();
+await multi.addClick(rider, 0, [{ x, y }], [1]);
+await multi.addClick(bike, 0, [{ x: x2, y: y2 }], [1]);
+for await (const f of multi.propagate()) {               // { frame, perObject, encoderMs }
+  const shown = nonOverlapping(new Map([...f.perObject].map(([id, o]) => [id, o.lowRes])));
+}
 ```
 
 | Module | Contents |
@@ -45,7 +56,8 @@ for await (const f of tracker.propagate(t, true)) {}     // reverse from frame t
 | `features.ts` | `encodeImage`, `withMemoryTokens` (`vision_feat`, `curr`) |
 | `head.ts` | `runHead`, `selectOutput` (multimask / stability / absent-object rules), `clampMaskInput` |
 | `imagePredictor.ts` | `ImagePredictor.setImage` / `predict` (box = leading labels 2 and 3) |
-| `videoTracker.ts` | `VideoTracker`: port of `OrtVideoTracker` in `tools/ort_video_loop.py` |
+| `videoTracker.ts` | `VideoTracker`: port of `OrtVideoTracker` in `tools/ort_video_loop.py`; `FrameEncoder`, the per-frame encoder cache |
+| `multiObjectTracker.ts` | `MultiObjectTracker`: independent `VideoTracker`s over one `FrameEncoder`, stepped frame by frame; `nonOverlapping` (display rule of `video_predictor.non_overlapping`) |
 | `browser.ts` | `resizeToSquare`, `pickProvider`, `configureOrt`, `fetchLoader`, `maskToImageData` |
 | `index.ts` | re-exports |
 
@@ -56,8 +68,12 @@ Graphs loaded (S = 512 by default, `size` option for 1024): `image_encoder_512.i
 The runtime calls only `InferenceSession.create`, `new Tensor` and `session.run`, so any ORT
 build works; register it once with `setOrt` (`configureOrt` does this in the browser).
 
-A `VideoTracker` processes one call at a time: await `addClick` and finish (or `break` out
-of) a `propagate` loop before the next call.
+A `VideoTracker` (or `MultiObjectTracker`) processes one call at a time: await `addClick`
+and finish (or `break` out of) a `propagate` loop before the next call. Objects in a
+`MultiObjectTracker` are independent, as in the reference: each memory bank sees its own
+unconstrained mask, and `nonOverlapping` resolves overlaps for display only. Per tracked
+frame the encoder runs once and the memory attention, head and memory encoder once per
+object.
 
 ## Tests
 
@@ -82,8 +98,14 @@ uses and no second ORT build is needed. Node runs with ORT's default thread coun
 2. Video parity: `clip_blackswan`, click on frame 0, forward propagation; per-frame IoU
    >= 0.99 at threshold 0 and object score within 0.1. A second test runs a correction
    click on a tracked frame and a reverse propagation.
-3. Unit tests: output selection branches, bfloat16 rounding, bilinear upsampling (hand
-   cases and a bit-exact numpy case), `normalize` bit-exactness, constants parsing.
+3. Multi-object parity: `clip_bmx-trees`, the rider and the bike clicked on frame 0 and
+   tracked together by a `MultiObjectTracker`; each object's per-frame IoU >= 0.99 against
+   its own single-object Python run, the encoder called once per frame, `nonOverlapping`
+   bit-exact against the torch `non_overlapping` of those runs, and an object's masks
+   bit-identical to tracking it alone.
+4. Unit tests: output selection branches, bfloat16 rounding, bilinear upsampling (hand
+   cases and a bit-exact numpy case), `normalize` bit-exactness, constants parsing,
+   `nonOverlapping`.
 
 ## What the website copies
 

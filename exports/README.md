@@ -260,8 +260,10 @@ is yielded with its stored prediction and not re-tracked)
 13. Display: bilinear upsample of `pred_masks` to the video size, threshold 0; the object
     is occluded when `score <= 0`.
 
-**Deviations from `video_predictor.py`**: one object (the demo's scope; the torch side
-batches objects independently anyway); no mask prompt (`add_mask`) and no box in
+**Deviations from `video_predictor.py`**: one object per loop (several objects run as
+independent loops over one encoder pass per frame, `web/src/multiObjectTracker.ts`, where
+the torch side batches them; overlaps are resolved for display by the same
+`non_overlapping` rule); no mask prompt (`add_mask`) and no box in
 `add_click` (the head accepts a box as labels 2 and 3, so adding it is mechanical);
 `clear_old_points` is always true. Everything else, including corrections on tracked
 frames and the general frame-selection rules (`max_cond_frames_in_attn`, temporal

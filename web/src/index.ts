@@ -31,11 +31,20 @@ export {
 } from "./head";
 export { ImagePredictor, type Box, type ImagePrediction, type Point } from "./imagePredictor";
 export {
+  FrameEncoder,
   selectClosestCondFrames,
   VideoTracker,
+  type FrameEncoderOptions,
   type FrameSource,
   type TrackedFrame,
   type VideoSize,
   type VideoTrackerOptions,
 } from "./videoTracker";
+export {
+  MultiObjectTracker,
+  NON_OVERLAP_CLAMP,
+  nonOverlapping,
+  type MultiTrackedFrame,
+  type ObjectFrame,
+} from "./multiObjectTracker";
 export { configureOrt, fetchLoader, maskToImageData, pickProvider, resizeToSquare } from "./browser";

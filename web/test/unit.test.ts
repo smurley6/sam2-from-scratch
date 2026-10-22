@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseConstants } from "../src/constants";
 import { clampMaskInput, selectOutput, stabilityScore } from "../src/head";
 import { normalize, roundBf16, upsampleBilinear } from "../src/preprocess";
+import { nonOverlapping } from "../src/multiObjectTracker";
 import { selectClosestCondFrames } from "../src/videoTracker";
 
 const bits = (x: Float32Array): number[] => Array.from(new Uint32Array(x.buffer, x.byteOffset, x.length));
@@ -209,5 +210,33 @@ describe("misc", () => {
     expect(c.maskmem_tpos_enc[0]?.[0]).toBe(0.280518501996994);
     expect(c.pixel_mean[0]).toBe(0.485);
     expect(() => parseConstants({ ...JSON.parse("{}") })).toThrow();
+  });
+});
+
+describe("nonOverlapping", () => {
+  it("keeps only the best object per pixel and clamps the rest to -10 (the torch test case)", () => {
+    const a = Float32Array.from([5, -1, 2]);
+    const b = Float32Array.from([3, 4, 2.5]);
+    const out = nonOverlapping(new Map([[7, a], [9, b]]));
+    expect([...out.keys()]).toEqual([7, 9]);
+    expect(Array.from(out.get(7) as Float32Array)).toEqual([5, -10, -10]);
+    expect(Array.from(out.get(9) as Float32Array)).toEqual([-10, 4, 2.5]);
+    // Inputs are untouched; a losing logit already below -10 stays where it is.
+    expect(Array.from(a)).toEqual([5, -1, 2]);
+    const low = nonOverlapping(new Map([[1, Float32Array.of(-20)], [2, Float32Array.of(1)]]));
+    expect(Array.from(low.get(1) as Float32Array)).toEqual([-20]);
+  });
+
+  it("ties go to the earlier object, as torch.argmax picks the first maximum", () => {
+    const out = nonOverlapping(new Map([[2, Float32Array.of(1)], [1, Float32Array.of(1)]]));
+    expect(Array.from(out.get(2) as Float32Array)).toEqual([1]);
+    expect(Array.from(out.get(1) as Float32Array)).toEqual([-10]);
+  });
+
+  it("one object or none is returned as is", () => {
+    const a = Float32Array.from([-30, 2]);
+    const one = nonOverlapping(new Map([[3, a]]));
+    expect(one.get(3)).toBe(a);
+    expect(nonOverlapping(new Map()).size).toBe(0);
   });
 });
