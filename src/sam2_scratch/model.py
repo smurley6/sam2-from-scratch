@@ -149,9 +149,12 @@ class SAM2(nn.Module):
         self.no_obj_ptr = nn.Parameter(torch.zeros(1, c))
         # Added to the spatial memory of frames where the object is absent.
         self.no_obj_embed_spatial = nn.Parameter(torch.zeros(1, m))
-        # Temporal encoding of a memory's slot: index 0 is the previous frame, index
-        # num_maskmem - 1 is used by conditioning frames.
-        self.maskmem_tpos_enc = nn.Parameter(torch.zeros(cfg.num_maskmem, 1, 1, m))
+        # Temporal encoding of a memory's slot: row 0 is the previous frame, row
+        # maskmem_tpos_rows - 1 (the last trained row) is used by conditioning frames.
+        # The rows stay at the trained count so that a smaller num_maskmem (an
+        # inference-time ablation) still loads the checkpoint and keeps each slot's
+        # trained encoding.
+        self.maskmem_tpos_enc = nn.Parameter(torch.zeros(cfg.maskmem_tpos_rows, 1, 1, m))
         self.obj_ptr_proj = MLP(c, c, c, 3)
         self.obj_ptr_tpos_proj = nn.Linear(c, m)
         # 1024 -> 256 downsampler used to feed a ground-truth mask prompt to the SAM head.
@@ -382,7 +385,8 @@ class SAM2(nn.Module):
             feats = prev_out.maskmem_features.to(dev, torch.float32)
             memories.append(feats.flatten(2).permute(2, 0, 1))
             pos = prev_out.maskmem_pos_enc[-1].to(dev).flatten(2).permute(2, 0, 1)
-            memory_pos.append(pos + self.maskmem_tpos_enc[self.num_maskmem - t_pos - 1])
+            row = self.cfg.maskmem_tpos_rows - 1 if t_pos == 0 else self.num_maskmem - t_pos - 1
+            memory_pos.append(pos + self.maskmem_tpos_enc[row])
 
         # (c): object pointers, each with a signed temporal distance to this frame.
         max_ptrs = min(num_frames, cfg.max_obj_ptrs_in_encoder)

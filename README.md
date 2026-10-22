@@ -34,7 +34,7 @@ and memory features are stored in bfloat16.
 | Model | J&F | J | F | Notes |
 |-------|----:|--:|--:|-------|
 | Hiera-T (this repo, SAM 2.1 weights) | 87.65 | 84.89 | 90.42 | 30 sequences, 1024 px |
-| Hiera-S (this repo, SAM 2.1 weights) | {{SMALL_JF}} | {{SMALL_J}} | {{SMALL_F}} | |
+| Hiera-S (this repo, SAM 2.1 weights) | 87.96 | 85.31 | 90.62 | |
 | Hiera-T, SAM 2 paper Table 17(d) | 89.4 | 85.8 | 92.9 | model trained with additional internal data, not released |
 | Hiera-S, SAM 2 paper Table 17(d) | 89.6 | 86.3 | 92.9 | same |
 

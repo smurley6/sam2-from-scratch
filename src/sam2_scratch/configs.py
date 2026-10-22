@@ -85,6 +85,9 @@ class SAM2Config:
     hidden_dim: int = 256
     mem_dim: int = 64
     num_maskmem: int = 7
+    # Rows of the trained temporal-slot embedding; fixed by the checkpoint. num_maskmem may
+    # be lowered for ablations without changing this.
+    maskmem_tpos_rows: int = 7
     max_cond_frames_in_attn: int = -1
     max_obj_ptrs_in_encoder: int = 16
     memory_temporal_stride_for_eval: int = 1
