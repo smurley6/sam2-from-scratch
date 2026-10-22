@@ -98,6 +98,13 @@ the browser (one object per demo run); mobile-phone performance targets.
 
 ## Change log
 
+- 2026-10-22 (shipped): github.com/smurley6/sam2-from-scratch public; stevenmurley.com/projects/sam2
+  and /demo/sam2 deployed and verified live on WebGPU. T8 done (React demo reviewed and
+  fixed: bounded overlay cache, unmount cleanup, consent before download, WASM worker
+  proxy, a11y). Ablations complete: no pointers 87.59, 3 memories 86.52, 1 memory 82.16,
+  512 px 82.09 (base 87.65). Two model fixes found by the ablations: maskmem_tpos_enc keeps
+  its trained 7 rows for any num_maskmem, and use_obj_ptrs_in_encoder is now honoured.
+
 - 2026-10-22 (later): T6b landed (memory encoder, memory attention, pointer graphs; pure
   onnxruntime loop exact in fp32 at 1024 and 512; shipped-precision study in
   exports/README.md). DAVIS 2017 val Hiera-T J&F 87.65; the official package scores

@@ -42,10 +42,15 @@ On three sequences re-run with the official package and the public checkpoints, 
 code scores the same as this repo to within 0.002 points (`docs/results/davis_reference_subset.json`),
 so the gap to the paper is the checkpoint, not the implementation.
 
-**Resolution, Hiera-T on DAVIS 2017 val:** 512 px input scores 82.09 J&F (J 79.84, F 84.35)
-against 87.65 at 1024 px, at roughly four times the frame rate; the browser demo runs at 512.
-Memory-bank ablations (number of memories, object pointers) are in `docs/results/` as they
-complete.
+**Ablations, Hiera-T on DAVIS 2017 val, same protocol** (`docs/results/`, `docs/figures/ablations.png`):
+
+| Setting | J&F | J | F |
+|---------|----:|--:|--:|
+| Released settings (7 memories, 16 object pointers, 1024 px) | 87.65 | 84.89 | 90.42 |
+| No object pointers | 87.59 | 84.89 | 90.29 |
+| 3 memories | 86.52 | 83.94 | 89.10 |
+| 1 memory | 82.16 | 79.34 | 84.98 |
+| 512 px input (the browser demo's setting, about 4x faster) | 82.09 | 79.84 | 84.35 |
 
 **Browser.** Six ONNX graphs exported from this implementation at 512 px (and 1024 px in the
 repo): image encoder (int8 weight-only, 32.5 MB), prompt encoder + mask decoder, memory encoder,
