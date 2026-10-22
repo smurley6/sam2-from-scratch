@@ -411,7 +411,7 @@ class SAM2(nn.Module):
                 pos_and_ptrs.append((t_diff, out.obj_ptr))
 
         num_obj_ptr_tokens = 0
-        if pos_and_ptrs:
+        if pos_and_ptrs and cfg.use_obj_ptrs_in_encoder:
             obj_ptrs = torch.stack([p.to(dev) for _, p in pos_and_ptrs], dim=0)  # [N, B, C]
             # Distances are normalised by the window length before the sine encoding.
             t_diffs = torch.tensor([d for d, _ in pos_and_ptrs], device=dev)
