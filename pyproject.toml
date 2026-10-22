@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam2-scratch"
+version = "0.1.0"
+description = "From-scratch PyTorch reimplementation of the SAM 2 inference architecture"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = ["torch>=2.5", "numpy", "pillow"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy", "onnx", "onnxruntime", "onnxscript", "opencv-python", "tqdm"]
+reference = ["SAM-2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "N"]
+ignore = ["N803", "N806"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src", "."]
+markers = ["reference: needs the official sam2 package and checkpoints"]

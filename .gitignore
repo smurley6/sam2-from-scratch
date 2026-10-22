@@ -1,0 +1,11 @@
+.venv/
+checkpoints/*.pt
+data/
+reference_dumps/
+exports/*.onnx
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

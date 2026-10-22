@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/sam2_scratch/__init__.py
+src/sam2_scratch/common.py
+src/sam2_scratch/configs.py
+src/sam2_scratch/weights.py
+src/sam2_scratch.egg-info/PKG-INFO
+src/sam2_scratch.egg-info/SOURCES.txt
+src/sam2_scratch.egg-info/dependency_links.txt
+src/sam2_scratch.egg-info/requires.txt
+src/sam2_scratch.egg-info/top_level.txt
+tests/test_foundation.py

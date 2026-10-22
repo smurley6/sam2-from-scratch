@@ -1,0 +1,16 @@
+torch>=2.5
+numpy
+pillow
+
+[dev]
+pytest
+ruff
+mypy
+onnx
+onnxruntime
+onnxscript
+opencv-python
+tqdm
+
+[reference]
+SAM-2
