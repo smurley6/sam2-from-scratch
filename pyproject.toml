@@ -37,3 +37,6 @@ testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["src", "."]
 markers = ["reference: needs the official sam2 package and checkpoints"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sam2_scratch", "tests"]
