@@ -1,0 +1,14 @@
+{
+  "note": "Official sam2 package (SAM2VideoPredictor, add_new_mask per object, argmax across objects) vs this reimplementation on three DAVIS 2017 val sequences, same checkpoint (sam2.1_hiera_tiny.pt), same protocol, both on Apple MPS. Scores from the official davis2017-evaluation package.",
+  "sequences": ["judo", "car-shadow", "motocross-jump"],
+  "J_per_object": {
+    "reference": {"judo_1": 86.072, "judo_2": 84.496, "car-shadow_1": 97.624, "motocross-jump_1": 91.703, "motocross-jump_2": 89.75},
+    "ours": {"judo_1": 86.071, "judo_2": 84.496, "car-shadow_1": 97.624, "motocross-jump_1": 91.704, "motocross-jump_2": 89.75}
+  },
+  "F_per_object": {
+    "reference": {"judo_1": 88.759, "judo_2": 87.894, "car-shadow_1": 99.787, "motocross-jump_1": 96.337, "motocross-jump_2": 84.324},
+    "ours": {"judo_1": 88.759, "judo_2": 87.894, "car-shadow_1": 99.787, "motocross-jump_1": 96.335, "motocross-jump_2": 84.324}
+  },
+  "max_abs_difference_points": 0.002,
+  "paper_reference": "SAM 2 paper (arXiv:2408.00714v2) Table 17(d): Hiera-T 89.4 J&F (85.8 J, 92.9 F), Hiera-S 89.6, for SAM 2 models trained on SA-1B + SA-V + internal data; Table 6: Hiera-B+ 90.2, Hiera-L 90.7. No DAVIS number is published for the SAM 2.1 checkpoints."
+}
